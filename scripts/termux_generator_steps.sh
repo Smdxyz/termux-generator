@@ -101,9 +101,14 @@ patch_bootstraps() {
 
 	if [[ "$TERMUX_APP__USER_PATH" != "/data/data" ]]; then
 		replace_termux_user_path termux-packages-main "$TERMUX_APP__USER_PATH"
-
-		echo "TERMUX_APP__USER_PATH=$TERMUX_APP__USER_PATH" >> termux-packages-main/scripts/properties.sh
 	fi
+
+	# Package build scripts (termux-tools, proot-distro) reference
+	# $TERMUX_APP__USER_PATH under 'set -u' inside the builder, so the
+	# variable must ALWAYS be defined in properties.sh - also for the
+	# default "/data/data" path, otherwise those builds die with
+	# "TERMUX_APP__USER_PATH: unbound variable".
+	echo "TERMUX_APP__USER_PATH=$TERMUX_APP__USER_PATH" >> termux-packages-main/scripts/properties.sh
 
     portable_sed_i -e "s|termux-package-builder|$TERMUX_GENERATOR_CONTAINER_NAME|g" termux-packages-main/scripts/run-docker.sh
 

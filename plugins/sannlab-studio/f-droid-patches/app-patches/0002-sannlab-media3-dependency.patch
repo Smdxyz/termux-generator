@@ -1,0 +1,26 @@
+From bd24f1bf14c6637081105f6cd775565676242552 Mon Sep 17 00:00:00 2001
+From: SannLab Studio <sannlab@local>
+Date: Tue, 20 Oct 2026 13:47:44 +0000
+Subject: [PATCH 2/3] build(sannlab): add Media3 1.11.1 (exoplayer + ui) for
+ video wallpaper
+
+---
+ termux-app/app/build.gradle | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/termux-app/app/build.gradle b/termux-app/app/build.gradle
+index 33c88d1..c39a044 100644
+--- a/termux-app/app/build.gradle
++++ b/termux-app/app/build.gradle
+@@ -29,6 +29,8 @@ android {
+         implementation "androidx.preference:preference:1.2.1"
+         implementation "androidx.viewpager:viewpager:1.0.0"
+         implementation "com.google.android.material:material:1.12.0"
++        implementation "androidx.media3:media3-exoplayer:1.11.1"
++        implementation "androidx.media3:media3-ui:1.11.1"
+         implementation "com.google.guava:guava:24.1-jre"
+         implementation "io.noties.markwon:core:$markwonVersion"
+         implementation "io.noties.markwon:ext-strikethrough:$markwonVersion"
+-- 
+2.43.0
+

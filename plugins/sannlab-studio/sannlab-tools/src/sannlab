@@ -1,0 +1,3 @@
+#!/bin/sh
+# SannLab Studio CLI launcher — logika ada di share/sannlab/sannlab.js
+exec node "$PREFIX/share/sannlab/sannlab.js" "$@"

@@ -1,0 +1,908 @@
+#!/usr/bin/env node
+'use strict';
+/*
+ * sannlab — SannLab Studio CLI
+ * ---------------------------------------------------------------------------
+ * Smart Node Modules Manager (Fase 2), Native Module Doctor (Fase 3),
+ * Terminal Experience helpers (Fase 4) dan Media Guard (Fase 5).
+ *
+ * Prinsip inti Fase 2:
+ *  - Source code pengguna TETAP di shared storage (mis. /storage/emulated/0/
+ *    Download/MyProject). Shared storage Android (sdcardfs/FUSE) TIDAK bisa
+ *    symlink -> npm gagal membuat node_modules di sana.
+ *  - Dependency + eksekusi berjalan di private HOME:
+ *    $HOME/.sannlab/workspaces/<project>/  (filesystem aplikasi, symlink OK).
+ *  - node_modules TIDAK PERNAH disalin/dibuat di shared storage.
+ *  - Sinkronisasi dua arah berbasis hash + manifest: perubahan di satu sisi
+ *    disalin; perubahan di DUA sisi = KONFLIK (tidak ada overwrite diam-diam;
+ *    kedua versi disimpan dan pengguna yang memutuskan).
+ *  - File terlindungi (.env*, *.db, *.sqlite*) hanya disalin MASUK sekali,
+ *    tidak pernah ditimpa dan tidak pernah disalin keluar.
+ *  - BUKAN NODE_PATH: kode benar-benar berjalan di workspace dengan
+ *    node_modules lokal -> CommonJS, ESM, dynamic import, package "exports",
+ *    dan native modules semuanya mengikuti resolusi standar Node.
+ *
+ * Zero dependency. CommonJS agar kompatibel luas.
+ */
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const { spawn, spawnSync } = require('child_process');
+
+const HOME = os.homedir();
+const SANNLAB_HOME = process.env.SANNLAB_HOME || path.join(HOME, '.sannlab');
+const WORKSPACES_DIR = path.join(SANNLAB_HOME, 'workspaces');
+const REGISTRY_FILE = path.join(SANNLAB_HOME, 'registry.json');
+const CONFIG_FILE = path.join(SANNLAB_HOME, 'config.json');
+const MANIFEST_NAME = '.sannlab-manifest.json';
+
+/* ------------------------------- utils ---------------------------------- */
+
+function die(msg, code) {
+  console.error('sannlab: ' + msg);
+  process.exit(code || 1);
+}
+function log(...a) { console.log(...a); }
+function sha1(buf) { return crypto.createHash('sha1').update(buf).digest('hex'); }
+function hashFile(p) { try { return sha1(fs.readFileSync(p)); } catch { return null; } }
+function readJson(p, fallback) {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return fallback; }
+}
+function writeJsonAtomic(p, obj) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const tmp = p + '.tmp-' + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n');
+  fs.renameSync(tmp, p);
+}
+function loadConfig() {
+  return Object.assign(
+    { mediaGuard: true, shims: false, logKeepSessions: 20, logMaxBytes: 5 * 1024 * 1024 },
+    readJson(CONFIG_FILE, {})
+  );
+}
+function saveConfig(cfg) { writeJsonAtomic(CONFIG_FILE, cfg); }
+function loadRegistry() {
+  return readJson(REGISTRY_FILE, { projects: [], activeId: null });
+}
+function saveRegistry(reg) { writeJsonAtomic(REGISTRY_FILE, reg); }
+function slugify(name) {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'project';
+}
+function projectId(sourceDir) {
+  return slugify(path.basename(sourceDir)) + '-' + sha1(Buffer.from(sourceDir)).slice(0, 6);
+}
+function isProtected(rel) {
+  const base = path.basename(rel);
+  return base === '.env' || base.startsWith('.env.') ||
+    /\.(db|sqlite|sqlite3)$/i.test(base);
+}
+const DEFAULT_EXCLUDES = ['node_modules', '.sannlab', '.git'];
+function loadIgnores(sourceDir) {
+  const pats = DEFAULT_EXCLUDES.slice();
+  const f = path.join(sourceDir, '.sannlabignore');
+  if (fs.existsSync(f)) {
+    for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+      const t = line.trim();
+      if (t && !t.startsWith('#')) pats.push(t.replace(/\/$/, ''));
+    }
+  }
+  return pats;
+}
+function isExcluded(rel, pats) {
+  const parts = rel.split('/');
+  for (const pat of pats) {
+    if (!pat) continue;
+    if (pat.includes('*')) {
+      const re = new RegExp('^' + pat.split('*').map(s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
+      if (re.test(rel) || re.test(path.basename(rel))) return true;
+    } else if (rel === pat || rel.startsWith(pat + '/') || parts.includes(pat)) {
+      return true;
+    }
+  }
+  return false;
+}
+/* Daftar file reguler di bawah root (relatif, '/'), tanpa mengikuti symlink dir. */
+function walkFiles(root, pats) {
+  const out = [];
+  if (!fs.existsSync(root)) return out;
+  const stack = [''];
+  while (stack.length) {
+    const rel = stack.pop();
+    const abs = rel ? path.join(root, rel) : root;
+    let entries;
+    try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const r = rel ? rel + '/' + e.name : e.name;
+      if (isExcluded(r, pats)) continue;
+      if (e.isDirectory()) stack.push(r);
+      else if (e.isFile()) out.push(r);
+    }
+  }
+  return out.sort();
+}
+function copyFileSyncEnsured(src, dst) {
+  fs.mkdirSync(path.dirname(dst), { recursive: true });
+  fs.copyFileSync(src, dst);
+  try { fs.chmodSync(dst, fs.statSync(src).mode); } catch { /* noop */ }
+}
+
+/* --------------------------- sync engine ---------------------------------
+ * Manifest per workspace: { files: { rel: { base: "<sha1 saat sinkron>" } },
+ *                           conflicts: { rel: { at, wsCopy } } }
+ * Aturan (b = hash dasar, s = hash source, w = hash workspace):
+ *   s == w            -> sinkron, perbarui base
+ *   s berubah, w sama -> salin source -> workspace (atau hapus di ws bila s null)
+ *   w berubah, s sama -> salin workspace -> source (atau hapus di src bila w null)
+ *   dua-duanya berubah & beda -> KONFLIK: jangan timpa; simpan salinan ws
+ *                        sebagai <rel>.conflict-<ts> di workspace, catat.
+ * File terlindungi: salin masuk sekali, lalu selalu dilewati & dilaporkan.
+ * ------------------------------------------------------------------------- */
+function syncProject(proj, opts) {
+  opts = opts || {};
+  const mode = opts.mode || 'both'; // both | in (src->ws) | out (ws->src)
+  const dry = !!opts.dryRun;
+  const pats = loadIgnores(proj.source);
+  const manifestPath = path.join(proj.workspace, MANIFEST_NAME);
+  const manifest = readJson(manifestPath, { files: {}, conflicts: {} });
+  manifest.files = manifest.files || {};
+  manifest.conflicts = manifest.conflicts || {};
+
+  const srcFiles = walkFiles(proj.source, pats);
+  const wsFiles = walkFiles(proj.workspace, pats)
+    .filter(r => r !== MANIFEST_NAME && !r.includes('.conflict-'));
+  const all = new Set([...srcFiles, ...wsFiles, ...Object.keys(manifest.files)]);
+  const report = { toWs: [], toSrc: [], delWs: [], delSrc: [], conflicts: [], protectedSkips: [] };
+
+  const srcAbs = r => path.join(proj.source, r);
+  const wsAbs = r => path.join(proj.workspace, r);
+
+  for (const rel of [...all].sort()) {
+    if (isProtected(rel)) {
+      const sH = hashFile(srcAbs(rel)), wH = hashFile(wsAbs(rel));
+      if (sH && !wH) {
+        if (!dry) copyFileSyncEnsured(srcAbs(rel), wsAbs(rel));
+        report.toWs.push(rel + ' (protected, copy-in)');
+        manifest.files[rel] = { base: 'protected' };
+      } else if (sH || wH) {
+        report.protectedSkips.push(rel);
+      }
+      continue;
+    }
+    const sH = hashFile(srcAbs(rel));
+    const wH = hashFile(wsAbs(rel));
+    const base = manifest.files[rel] ? manifest.files[rel].base : undefined;
+
+    if (sH === wH) {
+      if (sH) manifest.files[rel] = { base: sH };
+      else delete manifest.files[rel];
+      delete manifest.conflicts[rel];
+      continue;
+    }
+    const sChanged = base === undefined ? sH !== null : sH !== base;
+    const wChanged = base === undefined ? wH !== null : wH !== base;
+
+    if (sChanged && !wChanged && mode !== 'out') {
+      if (sH === null) { if (!dry) fs.rmSync(wsAbs(rel), { force: true }); report.delWs.push(rel); }
+      else { if (!dry) copyFileSyncEnsured(srcAbs(rel), wsAbs(rel)); report.toWs.push(rel); }
+      if (sH) manifest.files[rel] = { base: sH }; else delete manifest.files[rel];
+    } else if (wChanged && !sChanged && mode !== 'in') {
+      if (wH === null) { if (!dry) fs.rmSync(srcAbs(rel), { force: true }); report.delSrc.push(rel); }
+      else { if (!dry) copyFileSyncEnsured(wsAbs(rel), srcAbs(rel)); report.toSrc.push(rel); }
+      if (wH) manifest.files[rel] = { base: wH }; else delete manifest.files[rel];
+    } else if (sChanged && wChanged) {
+      // KONFLIK — simpan keduanya, jangan timpa apa pun.
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const conflictRel = rel + '.conflict-' + ts;
+      if (!dry && wH !== null) copyFileSyncEnsured(wsAbs(rel), wsAbs(conflictRel));
+      manifest.conflicts[rel] = { at: new Date().toISOString(), wsCopy: wH !== null ? conflictRel : null };
+      report.conflicts.push(rel);
+    }
+    // mode satu arah menahan arah sebaliknya tanpa menganggapnya konflik;
+    // state manifest untuk file itu dibiarkan agar sync berikutnya menilainya.
+  }
+
+  if (!dry) writeJsonAtomic(manifestPath, manifest);
+  return report;
+}
+
+function printSyncReport(report, dry) {
+  const n = (a) => a.length;
+  if (dry) log('[dry-run] tidak ada file yang diubah.');
+  if (n(report.toWs)) log('  -> workspace : ' + report.toWs.join(', '));
+  if (n(report.toSrc)) log('  -> source    : ' + report.toSrc.join(', '));
+  if (n(report.delWs)) log('  hapus di ws  : ' + report.delWs.join(', '));
+  if (n(report.delSrc)) log('  hapus di src : ' + report.delSrc.join(', '));
+  if (n(report.protectedSkips)) log('  dilindungi (dilewati): ' + report.protectedSkips.join(', '));
+  if (n(report.conflicts)) {
+    log('  KONFLIK (tidak ditimpa, perlu `sannlab resolve`): ' + report.conflicts.join(', '));
+  }
+  if (!n(report.toWs) && !n(report.toSrc) && !n(report.conflicts)) log('  sudah sinkron.');
+}
+
+/* --------------------------- project registry ---------------------------- */
+
+function findProject(reg, ref) {
+  if (!ref) {
+    const byCwd = reg.projects.find(p => {
+      const cwd = process.cwd();
+      return cwd === p.source || cwd.startsWith(p.source + path.sep);
+    });
+    if (byCwd) return byCwd;
+    return reg.projects.find(p => p.id === reg.activeId) || null;
+  }
+  return reg.projects.find(p => p.id === ref || p.name === ref) || null;
+}
+function requireProject(ref) {
+  const reg = loadRegistry();
+  const proj = findProject(reg, ref);
+  if (!proj) die('tidak ada project aktif/terdaftar. Jalankan `sannlab activate` di folder project.');
+  return proj;
+}
+
+/* ------------------------------ commands --------------------------------- */
+
+function cmdActivate(args) {
+  const source = path.resolve(args[0] && !args[0].startsWith('-') ? args[0] : process.cwd());
+  if (!fs.existsSync(source) || !fs.statSync(source).isDirectory()) die('folder tidak ditemukan: ' + source);
+  // Guard Fase 5: jangan pernah menaruh .nomedia di root shared storage /
+  // root Downloads itu sendiri — hanya folder project spesifik.
+  const base = path.basename(source);
+  if (['Download', 'Downloads', 'emulated', '0', ''].includes(base) || source === HOME) {
+    die('ini root penyimpanan/Downloads, bukan folder project. Masuk ke folder project spesifik dulu (mis. Download/MyProject).');
+  }
+  const cfg = loadConfig();
+  const reg = loadRegistry();
+  const id = projectId(source);
+  let proj = reg.projects.find(p => p.id === id);
+  if (!proj) {
+    proj = {
+      id, name: base, source,
+      workspace: path.join(WORKSPACES_DIR, id),
+      createdAt: new Date().toISOString(),
+    };
+    reg.projects.push(proj);
+  }
+  fs.mkdirSync(proj.workspace, { recursive: true });
+  reg.activeId = id;
+  saveRegistry(reg);
+
+  let nomedia = 'off';
+  if (cfg.mediaGuard) {
+    const nm = path.join(source, '.nomedia');
+    if (!fs.existsSync(nm)) fs.writeFileSync(nm, '');
+    nomedia = 'on (' + nm + ')';
+  }
+  log('Project aktif : ' + proj.name + ' [' + id + ']');
+  log('Source (tetap): ' + source);
+  log('Workspace     : ' + proj.workspace + '  (dependency & eksekusi di sini)');
+  log('Media guard   : ' + nomedia);
+  log('Sinkronisasi awal:');
+  printSyncReport(syncProject(proj, { mode: 'both' }), false);
+}
+
+function cmdStatus() {
+  const reg = loadRegistry();
+  if (!reg.projects.length) { log('Belum ada project. `sannlab activate` di folder project.'); return; }
+  for (const p of reg.projects) {
+    const manifest = readJson(path.join(p.workspace, MANIFEST_NAME), { conflicts: {} });
+    const nc = Object.keys(manifest.conflicts || {}).length;
+    log((p.id === reg.activeId ? '* ' : '  ') + p.name + ' [' + p.id + ']');
+    log('    source   : ' + p.source);
+    log('    workspace: ' + p.workspace + (nc ? '  | KONFLIK: ' + nc + ' file' : ''));
+    log('    node_modules di workspace: ' + (fs.existsSync(path.join(p.workspace, 'node_modules')) ? 'ada' : 'belum'));
+    log('    node_modules di source   : ' + (fs.existsSync(path.join(p.source, 'node_modules')) ? 'ADA (tidak dibuat sannlab)' : 'tidak ada (benar)'));
+  }
+}
+
+function cmdSync(args) {
+  const proj = requireProject(args.find(a => !a.startsWith('-')));
+  const mode = args.includes('--in') ? 'in' : args.includes('--out') ? 'out' : 'both';
+  const dry = args.includes('--dry-run');
+  log('Sinkronisasi ' + proj.name + ' (mode: ' + mode + '):');
+  printSyncReport(syncProject(proj, { mode, dryRun: dry }), dry);
+}
+
+function cmdResolve(args) {
+  const rel = args[0];
+  const keep = args.includes('--keep-workspace') ? 'workspace'
+    : args.includes('--keep-source') ? 'source' : null;
+  if (!rel || !keep) die('pakai: sannlab resolve <path-relatif> --keep-source | --keep-workspace');
+  const proj = requireProject();
+  const manifestPath = path.join(proj.workspace, MANIFEST_NAME);
+  const manifest = readJson(manifestPath, { files: {}, conflicts: {} });
+  if (!manifest.conflicts || !manifest.conflicts[rel]) die('tidak ada konflik tercatat untuk: ' + rel);
+  const winner = keep === 'workspace' ? path.join(proj.workspace, rel) : path.join(proj.source, rel);
+  const loser = keep === 'workspace' ? path.join(proj.source, rel) : path.join(proj.workspace, rel);
+  if (fs.existsSync(winner)) copyFileSyncEnsured(winner, loser);
+  else fs.rmSync(loser, { force: true });
+  const h = hashFile(path.join(proj.workspace, rel));
+  if (h) manifest.files[rel] = { base: h }; else delete manifest.files[rel];
+  // salinan konflik disimpan sebagai arsip, tidak dihapus diam-diam
+  delete manifest.conflicts[rel];
+  writeJsonAtomic(manifestPath, manifest);
+  log('Konflik ' + rel + ' selesai: versi ' + keep + ' dipakai. Salinan konflik tetap tersimpan di workspace.');
+}
+
+/* Jalankan perintah di workspace. Inti Fase 2: cwd eksekusi = workspace
+ * (private, symlink OK), sedangkan pengguna tetap "berada" di folder
+ * Downloads — SANNLAB_PROJECT_DIR menunjuk lokasi aslinya. */
+function runInWorkspace(proj, cmd, cmdArgs, opts) {
+  opts = opts || {};
+  if (!opts.skipSyncIn) {
+    const rep = syncProject(proj, { mode: 'both' });
+    if (rep.conflicts.length) {
+      die('ada konflik sinkronisasi (' + rep.conflicts.join(', ') + '). Selesaikan dengan `sannlab resolve` sebelum menjalankan perintah.');
+    }
+  }
+  log('[sannlab] project : ' + proj.source);
+  log('[sannlab] eksekusi: ' + proj.workspace + ' $ ' + cmd + ' ' + cmdArgs.join(' '));
+  const env = Object.assign({}, process.env, {
+    SANNLAB_PROJECT_DIR: proj.source,
+    SANNLAB_WORKSPACE: proj.workspace,
+  });
+  const res = spawnSync(cmd, cmdArgs, { cwd: proj.workspace, env, stdio: 'inherit', shell: false });
+  if (res.error) die('gagal menjalankan ' + cmd + ': ' + res.error.message);
+  if (!opts.skipSyncOut) {
+    const rep = syncProject(proj, { mode: 'both' });
+    if (rep.conflicts.length) log('[sannlab] konflik baru muncul: ' + rep.conflicts.join(', '));
+  }
+  return res.status === null ? 1 : res.status;
+}
+
+function cmdInstall(args) {
+  const proj = requireProject();
+  const status = runInWorkspace(proj, 'npm', ['install'].concat(args));
+  const nmSrc = fs.existsSync(path.join(proj.source, 'node_modules'));
+  log('[sannlab] node_modules dibuat di workspace saja: ' + (nmSrc ? 'PERINGATAN: ada node_modules di source (bukan oleh sannlab)' : 'ya'));
+  process.exit(status);
+}
+function cmdNpm(args) { process.exit(runInWorkspace(requireProject(), 'npm', args)); }
+function cmdNode(args) { process.exit(runInWorkspace(requireProject(), 'node', args)); }
+
+function cmdShims(args) {
+  const cfg = loadConfig();
+  if (args[0] === 'on') { cfg.shims = true; saveConfig(cfg); log('Shim npm/node aktif. Muat ulang shell atau `source $PREFIX/share/sannlab/sannlab.sh`.'); }
+  else if (args[0] === 'off') { cfg.shims = false; saveConfig(cfg); log('Shim nonaktif.'); }
+  else log('shims: ' + (cfg.shims ? 'on' : 'off') + ' — ganti dengan `sannlab shims on|off`');
+}
+function cmdMediaGuard(args) {
+  const cfg = loadConfig();
+  if (args[0] === 'on') cfg.mediaGuard = true;
+  else if (args[0] === 'off') cfg.mediaGuard = false;
+  saveConfig(cfg);
+  log('mediaGuard (.nomedia per project): ' + (cfg.mediaGuard ? 'on' : 'off'));
+}
+
+
+/* ================= Fase 4: supervised exec + Smart Log Viewer ============ */
+
+function logsDir(proj) { return path.join(proj.workspace, '.sannlab', 'logs'); }
+
+function listSessions(proj) {
+  const dir = logsDir(proj);
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).sort().map(id => {
+    const meta = readJson(path.join(dir, id, 'meta.json'), {});
+    return Object.assign({ id }, meta);
+  });
+}
+function pruneLogs(proj) {
+  const cfg = loadConfig();
+  const sessions = listSessions(proj);
+  const excess = sessions.slice(0, Math.max(0, sessions.length - cfg.logKeepSessions));
+  for (const s of excess) fs.rmSync(path.join(logsDir(proj), s.id), { recursive: true, force: true });
+}
+
+function cmdExec(args) {
+  const sep = args.indexOf('--');
+  const cmd = sep >= 0 ? args[sep + 1] : args[0];
+  const cmdArgs = sep >= 0 ? args.slice(sep + 2) : args.slice(1);
+  if (!cmd) die('pakai: sannlab exec [--label nama] -- <perintah> [args...]');
+  let label = cmd;
+  const li = args.indexOf('--label');
+  if (li >= 0 && args[li + 1]) label = args[li + 1];
+  const proj = requireProject();
+  const rep = syncProject(proj, { mode: 'both' });
+  if (rep.conflicts.length) die('konflik sinkronisasi aktif: ' + rep.conflicts.join(', '));
+
+  const id = new Date().toISOString().replace(/[:.]/g, '-') + '-' + slugify(label);
+  const sdir = path.join(logsDir(proj), id);
+  fs.mkdirSync(sdir, { recursive: true });
+  const outStream = fs.createWriteStream(path.join(sdir, 'out.log'));
+  const errStream = fs.createWriteStream(path.join(sdir, 'err.log'));
+  const stamp = (chunk, stream, mirror) => {
+    for (const line of chunk.toString().split('\n')) {
+      if (line === '') continue;
+      stream.write('[' + new Date().toISOString() + '] ' + line + '\n');
+    }
+    mirror.write(chunk);
+  };
+  log('[sannlab] supervised: ' + cmd + ' ' + cmdArgs.join(' ') + ' (sesi log: ' + id + ')');
+  const child = spawn(cmd, cmdArgs, {
+    cwd: proj.workspace,
+    env: Object.assign({}, process.env, { SANNLAB_PROJECT_DIR: proj.source, SANNLAB_WORKSPACE: proj.workspace }),
+    shell: false,
+  });
+  child.stdout.on('data', c => stamp(c, outStream, process.stdout));
+  child.stderr.on('data', c => stamp(c, errStream, process.stderr));
+  child.on('error', e => die('gagal menjalankan ' + cmd + ': ' + e.message));
+  child.on('close', code => {
+    outStream.end(); errStream.end();
+    writeJsonAtomic(path.join(sdir, 'meta.json'), {
+      cmd: cmd + ' ' + cmdArgs.join(' '), label, started: id.slice(0, 24), exitCode: code,
+    });
+    pruneLogs(proj);
+    syncProject(proj, { mode: 'both' });
+    process.exit(code === null ? 1 : code);
+  });
+}
+
+const SECRET_KEY_RE = /\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|CREDENTIAL|AUTH)[A-Z0-9_]*)\s*[:=]\s*["']?([^\s"',}]+)/gi;
+function projectEnvValues(proj) {
+  const vals = [];
+  for (const name of ['.env', '.env.local']) {
+    const f = path.join(proj.workspace, name);
+    if (!fs.existsSync(f)) continue;
+    for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+      const m = line.match(/^\s*[A-Za-z0-9_]+\s*=\s*(.+)\s*$/);
+      if (m && m[1].trim().length >= 4) vals.push(m[1].trim().replace(/^["']|["']$/g, ''));
+    }
+  }
+  return vals;
+}
+function redactText(text, extraValues) {
+  let count = 0;
+  let out = text.replace(SECRET_KEY_RE, (m, k) => { count++; return k + '=[REDACTED]'; });
+  out = out.replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/g, () => { count++; return 'Bearer [REDACTED]'; });
+  for (const v of extraValues || []) {
+    if (v && v.length >= 4 && out.includes(v)) { out = out.split(v).join('[REDACTED]'); count++; }
+  }
+  return { text: out, count };
+}
+
+function cmdLogs(args) {
+  const proj = requireProject(args.find(a => !a.startsWith('-') && a !== 'logs'));
+  const sessions = listSessions(proj);
+  if (!sessions.length) die('belum ada sesi log. Jalankan perintah lewat `sannlab exec -- <cmd>`.');
+  const sid = args.includes('--session') ? args[args.indexOf('--session') + 1] : sessions[sessions.length - 1].id;
+  const only = args.includes('--only') ? args[args.indexOf('--only') + 1] : 'all';
+  const grep = args.includes('--grep') ? args[args.indexOf('--grep') + 1] : null;
+  const tail = args.includes('--tail') ? parseInt(args[args.indexOf('--tail') + 1], 10) : null;
+  const gather = (kind) => {
+    const f = path.join(logsDir(proj), sid, kind + '.log');
+    if (!fs.existsSync(f)) return [];
+    return fs.readFileSync(f, 'utf8').split('\n').filter(Boolean).map(l => {
+      const m = l.match(/^\[([^\]]+)\]\s*(.*)$/);
+      return { ts: m ? m[1] : '', text: '[' + kind + '] ' + l };
+    });
+  };
+  let entries = [];
+  if (only === 'all' || only === 'out') entries = entries.concat(gather('out'));
+  if (only === 'all' || only === 'err') entries = entries.concat(gather('err'));
+  entries.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0)); // kronologis via stempel ISO
+  let lines = entries.map(e => e.text);
+  if (grep) lines = lines.filter(l => l.includes(grep));
+  if (tail) lines = lines.slice(-tail);
+  const exportIdx = args.indexOf('--export');
+  if (exportIdx >= 0) {
+    const target = args[exportIdx + 1] && !args[exportIdx + 1].startsWith('-')
+      ? path.resolve(args[exportIdx + 1])
+      : path.join(proj.source, 'sannlab-log-' + sid + '.txt');
+    const { text, count } = redactText(lines.join('\n') + '\n', projectEnvValues(proj));
+    fs.writeFileSync(target, text);
+    log('Log diekspor ke ' + target + ' (' + count + ' nilai sensitif diredaksi).');
+    return;
+  }
+  log('--- sesi ' + sid + ' ---');
+  for (const l of lines) log(l);
+}
+
+/* ================= Fase 4: Resource Monitor ============================== */
+
+function cpuSample() {
+  try {
+    const line = fs.readFileSync('/proc/stat', 'utf8').split('\n')[0];
+    const n = line.trim().split(/\s+/).slice(1).map(Number);
+    const idle = n[3] + (n[4] || 0);
+    const total = n.reduce((a, b) => a + b, 0);
+    return { idle, total };
+  } catch { return null; }
+}
+function listeningPorts() {
+  const ports = new Set();
+  for (const f of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    try {
+      for (const line of fs.readFileSync(f, 'utf8').split('\n').slice(1)) {
+        const parts = line.trim().split(/\s+/);
+        if (parts[3] === '0A') { // LISTEN
+          const port = parseInt(parts[1].split(':')[1], 16);
+          if (port) ports.add(port);
+        }
+      }
+    } catch { /* platform tanpa /proc */ }
+  }
+  return [...ports].sort((a, b) => a - b);
+}
+function thermalInfo() {
+  const out = [];
+  try {
+    for (const z of fs.readdirSync('/sys/class/thermal')) {
+      if (!z.startsWith('thermal_zone')) continue;
+      try {
+        const t = fs.readFileSync('/sys/class/thermal/' + z + '/type', 'utf8').trim();
+        const v = parseInt(fs.readFileSync('/sys/class/thermal/' + z + '/temp', 'utf8').trim(), 10);
+        if (!isNaN(v)) out.push({ zone: t || z, celsius: Math.round(v / 100) / 10 });
+      } catch { /* zona tidak terbaca */ }
+    }
+  } catch { /* tidak tersedia */ }
+  return out;
+}
+async function cmdMonitor(args) {
+  const asJson = args.includes('--json');
+  const a = cpuSample();
+  await new Promise(r => setTimeout(r, 400));
+  const b = cpuSample();
+  let cpuPct = null;
+  if (a && b) {
+    const dt = b.total - a.total, di = b.idle - a.idle;
+    if (dt > 0) cpuPct = Math.round((1 - di / dt) * 1000) / 10;
+  }
+  let mem = null;
+  try {
+    const mi = {};
+    for (const line of fs.readFileSync('/proc/meminfo', 'utf8').split('\n')) {
+      const m = line.match(/^(\w+):\s+(\d+)/); if (m) mi[m[1]] = Number(m[2]);
+    }
+    if (mi.MemTotal) mem = { totalMB: Math.round(mi.MemTotal / 1024), availMB: Math.round((mi.MemAvailable || 0) / 1024) };
+  } catch { /* noop */ }
+  const storageOf = (p) => {
+    try { const s = fs.statfsSync(p); return { path: p, freeMB: Math.round(s.bavail * s.bsize / 1048576), totalMB: Math.round(s.blocks * s.bsize / 1048576) }; }
+    catch { return null; }
+  };
+  const proj = (() => { try { return requireProject(); } catch { return null; } })();
+  const data = {
+    cpu_percent: cpuPct,
+    memory: mem,
+    storage: [storageOf(HOME), proj ? storageOf(proj.source) : null].filter(Boolean),
+    listening_ports: listeningPorts(),
+    thermal: thermalInfo(),
+    processes_hint: 'daftar proses per-pengguna: lihat `ps`/`top` (Android membatasi visibilitas antar-app)',
+  };
+  if (asJson) { log(JSON.stringify(data, null, 2)); return; }
+  log('CPU        : ' + (cpuPct === null ? 'n/a' : cpuPct + ' %'));
+  if (mem) log('RAM        : tersedia ' + mem.availMB + ' MB dari ' + mem.totalMB + ' MB');
+  for (const s of data.storage) log('Storage    : ' + s.path + ' — bebas ' + s.freeMB + ' MB dari ' + s.totalMB + ' MB');
+  log('Port LISTEN: ' + (data.listening_ports.length ? data.listening_ports.join(', ') : 'tidak ada'));
+  if (data.thermal.length) for (const t of data.thermal) log('Suhu       : ' + t.zone + ' ' + t.celsius + ' °C');
+  else log('Suhu       : tidak tersedia dari aplikasi ini (batasan Android)');
+}
+
+/* ================= Fase 4: history & smart suggestions =================== */
+
+function readHistory() {
+  const files = [process.env.HISTFILE, path.join(HOME, '.bash_history'), path.join(HOME, '.zsh_history')].filter(Boolean);
+  const lines = [];
+  for (const f of files) {
+    try {
+      for (let line of fs.readFileSync(f, 'utf8').split('\n')) {
+        line = line.replace(/^: \d+:\d+;/, '').trim(); // format zsh extended
+        if (line) lines.push(line);
+      }
+    } catch { /* tidak ada */ }
+  }
+  return lines;
+}
+const SUBCOMMAND_HINTS = {
+  npm: ['install', 'install --ignore-scripts', 'run', 'run dev', 'start', 'test', 'ci', 'ls', 'outdated', 'cache clean --force'],
+  node: ['--version', '-e', '--inspect'],
+  git: ['status', 'pull', 'push', 'add .', 'commit -m', 'log --oneline', 'diff', 'branch', 'checkout'],
+  python: ['--version', '-m pip install -r requirements.txt', '-m http.server'],
+  pip: ['install', 'list', 'freeze'],
+  ssh: ['-p 8022', '-i'],
+  pkg: ['install', 'update', 'search', 'list-installed'],
+  sannlab: ['activate', 'status', 'sync', 'install', 'run', 'exec', 'logs', 'doctor', 'monitor', 'session'],
+};
+function cmdSuggest(args) {
+  const prefix = args.join(' ');
+  if (!prefix) die('pakai: sannlab suggest <awalan perintah>');
+  const hist = readHistory();
+  const freq = new Map();
+  hist.forEach((l, i) => {
+    if (l.startsWith(prefix)) {
+      const e = freq.get(l) || { count: 0, last: 0 };
+      e.count++; e.last = i; freq.set(l, e);
+    }
+  });
+  const fromHist = [...freq.entries()]
+    .sort((x, y) => (y[1].count * 1000 + y[1].last) - (x[1].count * 1000 + x[1].last))
+    .slice(0, 8).map(e => e[0]);
+  const first = prefix.split(' ')[0];
+  const fromHints = (SUBCOMMAND_HINTS[first] || [])
+    .map(s => first + ' ' + s).filter(s => s.startsWith(prefix) && !fromHist.includes(s));
+  const all = fromHist.concat(fromHints).slice(0, 10);
+  if (!all.length) {
+    log('Tidak ada saran untuk "' + prefix + '". (command-not-found bawaan Termux: paket `command-not-found` memberi info paket untuk perintah yang hilang.)');
+    return;
+  }
+  log('Saran (tidak ada yang dijalankan otomatis):');
+  for (const s of all) log('  ' + s);
+}
+
+/* ================= Fase 4: multi-session (tmux) ========================= */
+
+function cmdSession(args) {
+  const sub = args[0] || 'list';
+  const tmuxOk = spawnSync('tmux', ['-V'], { encoding: 'utf8' });
+  if (tmuxOk.error) die('tmux tidak ditemukan. Di SannLab Studio tmux sudah termasuk bootstrap; di Termux biasa: pkg install tmux');
+  const run = (a, inherit) => spawnSync('tmux', a, inherit ? { stdio: 'inherit' } : { encoding: 'utf8' });
+  const proj = (() => { try { return requireProject(); } catch { return null; } })();
+  if (sub === 'list') {
+    const r = run(['list-sessions', '-F', '#{session_name}\t#{session_windows} windows\t#{session_attached} attached']);
+    log(r.stdout && r.stdout.trim() ? r.stdout.trim() : 'tidak ada sesi tmux.');
+  } else if (sub === 'new') {
+    const name = args[1] || (proj ? proj.name : 'main');
+    const r = run(['new-session', '-d', '-s', name, '-c', proj ? proj.workspace : HOME]);
+    if (r.status !== 0) die('gagal membuat sesi (mungkin nama sudah dipakai): ' + (r.stderr || '').trim());
+    log('Sesi "' + name + '" dibuat' + (proj ? ' di workspace ' + proj.name : '') + '. Buka: sannlab session attach ' + name);
+    log('Sesi tmux bertahan walau terminal ditutup (session restore selama proses tmux hidup).');
+  } else if (sub === 'attach') {
+    const name = args[1] || (proj ? proj.name : 'main');
+    process.exit(run(['attach-session', '-t', name], true).status || 0);
+  } else if (sub === 'kill') {
+    if (!args[1]) die('pakai: sannlab session kill <nama>');
+    run(['kill-session', '-t', args[1]], true);
+  } else die('pakai: sannlab session list|new [nama]|attach [nama]|kill <nama>');
+}
+
+/* ================= Fase 5: permission monitor ============================ */
+
+function cmdPermissions() {
+  log('Izin SannLab Studio (deklaratif, dari manifest — audit lengkap: SECURITY.md di repo)');
+  const rows = [
+    ['INTERNET / ACCESS_NETWORK_STATE', 'normal', 'fungsi terminal & jaringan'],
+    ['WAKE_LOCK / FOREGROUND_SERVICE', 'normal', 'sesi terminal persisten'],
+    ['READ/WRITE_EXTERNAL_STORAGE', 'legacy', 'akses source code di shared storage'],
+    ['MANAGE_EXTERNAL_STORAGE', 'khusus', 'model akses file penuh Termux (persetujuan pengguna di Settings)'],
+    ['RECEIVE_BOOT_COMPLETED', 'normal', 'Termux:Boot (opsional)'],
+    ['REQUEST_IGNORE_BATTERY_OPTIMIZATIONS', 'normal', 'mencegah sesi dibunuh OEM'],
+    ['SYSTEM_ALERT_WINDOW / REQUEST_INSTALL_PACKAGES / PACKAGE_USAGE_STATS', 'khusus', 'diwarisi upstream — kandidat dicabut, lihat SECURITY.md'],
+  ];
+  for (const r of rows) log('  ' + r[0] + '\n      level: ' + r[1] + ' — ' + r[2]);
+  log('Status grant per-izin tidak selalu dapat dibaca dari dalam aplikasi;');
+  log('sumber kebenaran: Android Settings > Apps > SannLab Studio > Permissions.');
+}
+
+/* ============================ Fase 3: Doctor ============================= */
+
+const RECIPES = {
+  sharp: {
+    termuxPkgs: ['libvips'],
+    steps: [
+      'pkg install libvips',
+      'pastikan toolchain ada: clang, make, pkg-config, python (sudah di bootstrap SannLab)',
+      'cd <project> && sannlab npm install sharp  (build dari source melawan libvips sistem bila prebuild gagal)',
+      'verifikasi: sannlab node -e "require(\'sharp\')" ',
+    ],
+    note: 'Prebuild resmi sharp menargetkan glibc/musl Linux — di Android (Bionic) umumnya gagal dimuat; jalur yang benar adalah build dari source melawan libvips Termux.',
+    confidence: 'jalur diketahui; verifikasi perangkat masih diperlukan',
+  },
+  canvas: {
+    termuxPkgs: ['libcairo', 'pango', 'libjpeg-turbo', 'giflib', 'librsvg'],
+    steps: ['pkg install libcairo pango libjpeg-turbo giflib librsvg', 'sannlab npm install canvas (build dari source)'],
+    note: 'node-canvas selalu build dari source di Android; butuh cairo + pango dari repo Termux.',
+    confidence: 'best-effort; verifikasi perangkat diperlukan',
+  },
+  bcrypt: {
+    termuxPkgs: [],
+    steps: ['pastikan python + clang + make tersedia', 'sannlab npm install bcrypt (node-gyp rebuild dari source bila prebuild gagal)'],
+    note: 'Prebuild bcrypt untuk linux-arm64 glibc tidak kompatibel dengan Bionic; node-gyp rebuild adalah jalur standarnya.',
+    confidence: 'best-effort; verifikasi perangkat diperlukan',
+  },
+  'better-sqlite3': {
+    termuxPkgs: ['libsqlite'],
+    steps: ['pkg install libsqlite', 'sannlab npm install better-sqlite3 --build-from-source (lewat sannlab npm)'],
+    note: 'Menggunakan libsqlite sistem Termux menghindari kompilasi amalgamation penuh.',
+    confidence: 'best-effort; verifikasi perangkat diperlukan',
+  },
+  sqlite3: {
+    termuxPkgs: ['libsqlite'],
+    steps: ['pkg install libsqlite', 'sannlab npm install sqlite3 (build dari source; prebuild glibc tidak kompatibel)'],
+    note: 'Sama seperti better-sqlite3: jalur source build melawan libsqlite Termux.',
+    confidence: 'best-effort; verifikasi perangkat diperlukan',
+  },
+};
+const KNOWN_NATIVE = Object.keys(RECIPES);
+
+function elfInfo(file) {
+  const info = { machine: null, interp: null, needed: [] };
+  try {
+    const fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(64);
+    fs.readSync(fd, buf, 0, 64, 0);
+    fs.closeSync(fd);
+    if (buf[0] === 0x7f && buf[1] === 0x45 && buf[4] === 2) { // ELF64
+      info.machine = buf.readUInt16LE(18); // 183 = AArch64, 62 = x86-64
+    }
+  } catch { /* abaikan */ }
+  const r = spawnSync('readelf', ['-l', '-d', file], { encoding: 'utf8' });
+  if (!r.error && r.stdout) {
+    const m = r.stdout.match(/Requesting program interpreter: ([^\]]+)\]/);
+    if (m) info.interp = m[1].trim();
+    info.needed = [...r.stdout.matchAll(/Shared library: \[([^\]]+)\]/g)].map(x => x[1]);
+  }
+  return info;
+}
+function isGlibcLinked(info) {
+  if (info.interp && info.interp.includes('ld-linux')) return true;
+  return info.needed.includes('libc.so.6') || info.needed.includes('libstdc++.so.6');
+}
+function detectEnv() {
+  const env = { platform: process.platform, arch: process.arch, node: process.version, nodeAbi: process.versions.modules };
+  const u = spawnSync('uname', ['-m'], { encoding: 'utf8' });
+  env.uname = u.error ? null : u.stdout.trim();
+  env.isAndroid = fs.existsSync('/system/bin/linker64');
+  env.isTermuxLike = !!(process.env.TERMUX_VERSION || (process.env.PREFIX || '').includes('termux') || (process.env.PREFIX || '').includes('sann.lab'));
+  if (env.isAndroid) env.libc = 'bionic (Android)';
+  else {
+    const ldd = spawnSync('ldd', ['--version'], { encoding: 'utf8' });
+    env.libc = ldd.error ? 'tidak diketahui' : (ldd.stdout || ldd.stderr).split('\n')[0];
+  }
+  env.compilers = {};
+  for (const c of ['clang', 'gcc', 'cc', 'make', 'pkg-config', 'python3']) {
+    const v = spawnSync(c, ['--version'], { encoding: 'utf8' });
+    env.compilers[c] = v.error ? null : (v.stdout || '').split('\n')[0].trim();
+  }
+  return env;
+}
+function findNativeFiles(modDir) {
+  const out = [];
+  const stack = [modDir];
+  while (stack.length) {
+    const d = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) { if (e.name !== 'node_modules') stack.push(p); }
+      else if (e.name.endsWith('.node')) out.push(p);
+    }
+  }
+  return out;
+}
+
+function cmdDoctor(args) {
+  const proj = requireProject();
+  const fix = args.includes('--fix');
+  const targets = args.filter(a => !a.startsWith('-'));
+  const env = detectEnv();
+  const lines = [];
+  const say = (s) => { lines.push(s); log(s); };
+  say('=== SannLab Doctor — Native Module Diagnosis (Fase 3) ===');
+  say('Platform : ' + env.platform + ' / ' + (env.uname || env.arch));
+  say('Node     : ' + env.node + ' (ABI ' + env.nodeAbi + ')');
+  say('libc     : ' + env.libc + (env.isAndroid ? '' : '  [lingkungan ini BUKAN Android — diagnosis .node untuk kompatibilitas Bionic tetap dijalankan]'));
+  say('Compiler : ' + ['clang', 'gcc', 'make', 'pkg-config', 'python3'].map(c => c + (env.compilers[c] ? ' ✓' : ' ✗')).join('  '));
+  if (!targets.length) {
+    const pkgJson = readJson(path.join(proj.workspace, 'package.json'), {});
+    const deps = Object.assign({}, pkgJson.dependencies, pkgJson.devDependencies);
+    for (const d of Object.keys(deps)) {
+      const dir = path.join(proj.workspace, 'node_modules', d);
+      if (KNOWN_NATIVE.includes(d) || (fs.existsSync(dir) && findNativeFiles(dir).length)) targets.push(d);
+    }
+    if (!targets.length) say('Tidak ada native module yang terdeteksi di package.json. Beri nama modul secara eksplisit: sannlab doctor sharp');
+  }
+  for (const mod of targets) {
+    say('');
+    say('--- ' + mod + ' ---');
+    const dir = path.join(proj.workspace, 'node_modules', mod);
+    if (!fs.existsSync(dir)) { say('Status   : TIDAK TERINSTAL di workspace. Install: sannlab install'); continue; }
+    const natives = findNativeFiles(dir);
+    if (!natives.length) { say('Status   : tidak ada binari .node (mungkin murni JS / belum ter-build).'); }
+    let glibc = false;
+    for (const f of natives) {
+      const info = elfInfo(f);
+      const archName = info.machine === 183 ? 'AArch64' : info.machine === 62 ? 'x86-64' : String(info.machine);
+      say('Binari   : ' + path.relative(proj.workspace, f) + ' (ELF machine ' + archName + (info.interp ? ', interp ' + info.interp : '') + ')');
+      if (isGlibcLinked(info)) { glibc = true; say('Temuan   : binari tertaut glibc (interp/NEEDED khas Linux glibc) -> TIDAK akan termuat di Android Bionic.'); }
+      if (info.machine && info.machine !== 183 && env.uname === 'aarch64') say('Temuan   : arsitektur binari bukan AArch64.');
+    }
+    const t = spawnSync('node', ['-e', 'require(' + JSON.stringify(mod) + ')'], { cwd: proj.workspace, encoding: 'utf8' });
+    if (t.status === 0) say('Load test: BERHASIL di lingkungan ini.');
+    else {
+      say('Load test: GAGAL di lingkungan ini.');
+      say('Error    : ' + (t.stderr || '').split('\n').slice(0, 3).join(' ').trim().slice(0, 300));
+      if (env.isAndroid || glibc) say('Klasifikasi: kemungkinan besar masalah prebuild/libc (lihat Temuan), bukan masalah kode project.');
+    }
+    const recipe = RECIPES[mod];
+    if (recipe) {
+      say('Resep perbaikan (' + recipe.confidence + '):');
+      for (const s of recipe.steps) say('  - ' + s);
+      say('Catatan  : ' + recipe.note);
+      if (fix && recipe.termuxPkgs.length) {
+        const hasPkg = !spawnSync('pkg', ['--version'], { encoding: 'utf8' }).error;
+        if (hasPkg) {
+          say('Menjalankan langkah pkg: pkg install -y ' + recipe.termuxPkgs.join(' '));
+          const r = spawnSync('pkg', ['install', '-y'].concat(recipe.termuxPkgs), { stdio: 'inherit' });
+          say('pkg selesai dengan kode ' + r.status + '. Langkah npm berikutnya jalankan manual sesuai resep (doctor tidak memakai --force).');
+        } else say('--fix dilewati: `pkg` tidak tersedia di lingkungan ini (bukan Termux).');
+      }
+    } else {
+      say('Resep khusus belum tersedia untuk modul ini. Prinsip umum: hindari prebuild glibc, build dari source dengan toolchain Termux, dan periksa `readelf -d` pada file .node-nya.');
+    }
+  }
+  // Catat seluruh diagnosis (aturan Fase 3: logging proses build & error).
+  const dir = path.join(proj.workspace, '.sannlab');
+  fs.mkdirSync(dir, { recursive: true });
+  const logFile = path.join(dir, 'doctor-' + new Date().toISOString().replace(/[:.]/g, '-') + '.log');
+  fs.writeFileSync(logFile, lines.join('\n') + '\n');
+  log('');
+  log('Log diagnosis: ' + logFile);
+}
+
+/* ================================ main =================================== */
+
+function help() {
+  log(`sannlab — SannLab Studio CLI
+
+Project & workspace (Fase 2):
+  sannlab activate [dir]        daftarkan folder project (Downloads) & siapkan workspace privat
+  sannlab status                daftar project, konflik, status node_modules
+  sannlab sync [--in|--out] [--dry-run]
+  sannlab resolve <file> --keep-source|--keep-workspace
+  sannlab install [args npm]    npm install DI WORKSPACE (bukan shared storage)
+  sannlab npm <args...>         teruskan ke npm di workspace
+  sannlab node <args...>        teruskan ke node di workspace
+  sannlab shims on|off          shim npm/node otomatis saat berada di folder project aktif
+  sannlab mediaguard on|off     .nomedia otomatis per folder project (Fase 5)
+
+Native modules (Fase 3):
+  sannlab doctor [modul...] [--fix]
+
+Terminal experience (Fase 4):
+  sannlab exec [--label x] -- <cmd>   jalan ter-supervisi, log stdout/stderr terpisah
+  sannlab logs [--only out|err] [--grep teks] [--tail n] [--session id] [--export [file]]
+  sannlab monitor [--json]
+  sannlab session list|new|attach|kill   (tmux)
+  sannlab suggest <awalan>      saran perintah dari riwayat (tidak pernah auto-run)
+
+Lainnya (Fase 5):
+  sannlab permissions           daftar & tujuan izin aplikasi
+`);
+}
+
+function main(argv) {
+  const cmd = argv[0];
+  const rest = argv.slice(1);
+  switch (cmd) {
+    case 'activate': return cmdActivate(rest);
+    case 'status': return cmdStatus();
+    case 'sync': return cmdSync(rest);
+    case 'resolve': return cmdResolve(rest);
+    case 'install': return cmdInstall(rest);
+    case 'npm': return cmdNpm(rest);
+    case 'node': return cmdNode(rest);
+    case 'shims': return cmdShims(rest);
+    case 'mediaguard': return cmdMediaGuard(rest);
+    case 'doctor': return cmdDoctor(rest);
+    case 'exec': return cmdExec(rest);
+    case 'logs': return cmdLogs(rest);
+    case 'monitor': return cmdMonitor(rest);
+    case 'session': return cmdSession(rest);
+    case 'suggest': return cmdSuggest(rest);
+    case 'permissions': return cmdPermissions();
+    case 'help': case '--help': case undefined: return help();
+    default: help(); die('perintah tidak dikenal: ' + cmd, 1);
+  }
+}
+
+module.exports = {
+  HOME, SANNLAB_HOME, WORKSPACES_DIR, REGISTRY_FILE, CONFIG_FILE, MANIFEST_NAME,
+  sha1, hashFile, readJson, writeJsonAtomic, loadConfig, saveConfig,
+  loadRegistry, saveRegistry, isProtected, loadIgnores, walkFiles,
+  syncProject, findProject, requireProject, runInWorkspace,
+  elfInfo, isGlibcLinked, detectEnv, redactText, RECIPES,
+  _internals: { listSessions, listeningPorts, readHistory },
+};
+
+if (require.main === module) main(process.argv.slice(2));

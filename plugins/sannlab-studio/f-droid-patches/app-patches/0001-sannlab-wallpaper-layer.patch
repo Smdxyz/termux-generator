@@ -1,0 +1,711 @@
+From f88c1c5e5fe5176872b1562f84bb3cb6f0a6c8f6 Mon Sep 17 00:00:00 2001
+From: SannLab Studio <sannlab@local>
+Date: Tue, 20 Oct 2026 13:47:38 +0000
+Subject: [PATCH 1/3] feat(sannlab): wallpaper layer behind terminal (image,
+ AMOLED, video engine)
+
+Adds the SannLab Studio Phase 1 wallpaper layer:
+- activity_termux.xml: FrameLayout layer stack (ImageView, Media3 PlayerView
+  with texture_view surface, black overlay view) as first child of the root
+  RelativeLayout, strictly behind DrawerLayout/TerminalView. TerminalView
+  does not paint a background, so the layer shows through untouched.
+- SannLabConfig: parses sannlab.* keys from the standard termux.properties
+  (upstream parser whitelists its own keys) and writes them back in place.
+- SannLabWallpaper: image mode (downsampled decode, opacity, brightness,
+  API 31+ RenderEffect blur), AMOLED pure black base, Media3/ExoPlayer
+  video mode (muted, looping, no audio focus, fps selection cap, error
+  fallback to still image/black), lifecycle driven from TermuxActivity.
+- TermuxActivity: minimal hooks (attach in onCreate, refresh in onResume,
+  pause in onStop, release in onDestroy).
+---
+ .../java/com/termux/app/TermuxActivity.java   |  19 +
+ .../com/termux/app/sannlab/SannLabConfig.java | 177 ++++++++
+ .../termux/app/sannlab/SannLabWallpaper.java  | 380 ++++++++++++++++++
+ .../src/main/res/layout/activity_termux.xml   |  35 ++
+ 4 files changed, 611 insertions(+)
+ create mode 100644 termux-app/app/src/main/java/com/termux/app/sannlab/SannLabConfig.java
+ create mode 100644 termux-app/app/src/main/java/com/termux/app/sannlab/SannLabWallpaper.java
+
+diff --git a/termux-app/app/src/main/java/com/termux/app/TermuxActivity.java b/termux-app/app/src/main/java/com/termux/app/TermuxActivity.java
+index 0c9f741..5886908 100644
+--- a/termux-app/app/src/main/java/com/termux/app/TermuxActivity.java
++++ b/termux-app/app/src/main/java/com/termux/app/TermuxActivity.java
+@@ -28,6 +28,7 @@ import android.widget.Toast;
+ 
+ import com.termux.R;
+ import com.termux.app.api.file.FileReceiverActivity;
++import com.termux.app.sannlab.SannLabWallpaper;
+ import com.termux.app.terminal.TermuxActivityRootView;
+ import com.termux.app.terminal.TermuxTerminalSessionActivityClient;
+ import com.termux.app.terminal.io.TermuxTerminalExtraKeys;
+@@ -91,6 +92,9 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
+      */
+     TerminalView mTerminalView;
+ 
++    /** SannLab Studio: wallpaper layer controller, attached after setContentView(). */
++    SannLabWallpaper mSannLabWallpaper;
++
+     /**
+      *  The {@link TerminalViewClient} interface implementation to allow for communication between
+      *  {@link TerminalView} and {@link TermuxActivity}.
+@@ -215,6 +219,9 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
+ 
+         setContentView(R.layout.activity_termux);
+ 
++        // SannLab Studio: attach the wallpaper layer living behind the terminal view.
++        mSannLabWallpaper = SannLabWallpaper.attach(this);
++
+         // Load termux shared preferences
+         // This will also fail if TermuxConstants.TERMUX_PACKAGE_NAME does not equal applicationId
+         mPreferences = TermuxAppSharedPreferences.build(this, true);
+@@ -315,6 +322,9 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
+         if (mTermuxTerminalViewClient != null)
+             mTermuxTerminalViewClient.onResume();
+ 
++        // SannLab Studio: re-read wallpaper config and resume video wallpaper.
++        if (mSannLabWallpaper != null) mSannLabWallpaper.onHostResume();
++
+         // Check if a crash happened on last run of the app or if a plugin crashed and show a
+         // notification with the crash details if it did
+         TermuxCrashUtils.notifyAppCrashFromCrashLogFile(this, LOG_TAG);
+@@ -340,6 +350,9 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
+ 
+         removeTermuxActivityRootViewGlobalLayoutListener();
+ 
++        // SannLab Studio: pause video wallpaper while the activity is not visible.
++        if (mSannLabWallpaper != null) mSannLabWallpaper.onHostPause();
++
+         unregisterTermuxActivityBroadcastReceiver();
+         getDrawer().closeDrawers();
+     }
+@@ -358,6 +371,12 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
+             mTermuxService = null;
+         }
+ 
++        // SannLab Studio: release wallpaper player and bitmap resources.
++        if (mSannLabWallpaper != null) {
++            mSannLabWallpaper.onHostRelease();
++            mSannLabWallpaper = null;
++        }
++
+         try {
+             unbindService(this);
+         } catch (Exception e) {
+diff --git a/termux-app/app/src/main/java/com/termux/app/sannlab/SannLabConfig.java b/termux-app/app/src/main/java/com/termux/app/sannlab/SannLabConfig.java
+new file mode 100644
+index 0000000..cb1a017
+--- /dev/null
++++ b/termux-app/app/src/main/java/com/termux/app/sannlab/SannLabConfig.java
+@@ -0,0 +1,177 @@
++package com.termux.app.sannlab;
++
++import com.termux.shared.termux.TermuxConstants;
++
++import java.io.BufferedReader;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStreamReader;
++import java.io.OutputStreamWriter;
++import java.nio.charset.StandardCharsets;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Properties;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/**
++ * SannLab Studio appearance configuration.
++ *
++ * <p>Values live in the standard Termux properties file ({@code $HOME/.termux/termux.properties},
++ * falling back to {@code $HOME/.config/termux/termux.properties} when only that file exists, mirroring
++ * the file selection upstream does via
++ * {@link com.termux.shared.settings.properties.SharedProperties}). Upstream's own property parser
++ * only loads its whitelisted keys, so the {@code sannlab.*} keys are parsed here directly from the
++ * same file. Nothing in upstream code needs to know about them.</p>
++ *
++ * <p>All keys and defaults:</p>
++ * <ul>
++ *     <li>{@code sannlab.background.type}: {@code none}|{@code image}|{@code video} (default {@code none})</li>
++ *     <li>{@code sannlab.background.path}: absolute path of the media file copied into the
++ *     SannLab media dir (default empty)</li>
++ *     <li>{@code sannlab.background.opacity}: 0-100, wallpaper view opacity (default 100)</li>
++ *     <li>{@code sannlab.background.brightness}: 50-150 percent (default 100)</li>
++ *     <li>{@code sannlab.background.blur}: 0-25 px radius, API 31+ only (default 0)</li>
++ *     <li>{@code sannlab.background.scale}: {@code centerCrop}|{@code fitCenter} (default {@code centerCrop})</li>
++ *     <li>{@code sannlab.background.overlay}: 0-100 percent black overlay over the wallpaper (default 30)</li>
++ *     <li>{@code sannlab.background.fps}: 0 (unlimited) or 15/24/30 video frame-rate cap (default 0)</li>
++ *     <li>{@code sannlab.amoled}: {@code true}|{@code false} pure black (#000000) base (default {@code false})</li>
++ * </ul>
++ */
++public final class SannLabConfig {
++
++    public static final String KEY_TYPE = "sannlab.background.type";
++    public static final String KEY_PATH = "sannlab.background.path";
++    public static final String KEY_OPACITY = "sannlab.background.opacity";
++    public static final String KEY_BRIGHTNESS = "sannlab.background.brightness";
++    public static final String KEY_BLUR = "sannlab.background.blur";
++    public static final String KEY_SCALE = "sannlab.background.scale";
++    public static final String KEY_OVERLAY = "sannlab.background.overlay";
++    public static final String KEY_FPS = "sannlab.background.fps";
++    public static final String KEY_AMOLED = "sannlab.amoled";
++
++    public static final String TYPE_NONE = "none";
++    public static final String TYPE_IMAGE = "image";
++    public static final String TYPE_VIDEO = "video";
++
++    public static final String SCALE_CENTER_CROP = "centerCrop";
++    public static final String SCALE_FIT_CENTER = "fitCenter";
++
++    public static final int DEFAULT_OPACITY = 100;
++    public static final int DEFAULT_BRIGHTNESS = 100;
++    public static final int DEFAULT_BLUR = 0;
++    public static final int DEFAULT_OVERLAY = 30;
++    public static final int DEFAULT_FPS = 0;
++
++    private static final Pattern SANNLAB_KEY_LINE = Pattern.compile("^\\s*(sannlab\\.[a-z0-9._-]+)\\s*=.*$");
++
++    public final String type;
++    public final String path;
++    public final int opacity;
++    public final int brightness;
++    public final int blur;
++    public final String scale;
++    public final int overlay;
++    public final int fps;
++    public final boolean amoled;
++
++    private SannLabConfig(Properties props) {
++        String parsedType = props.getProperty(KEY_TYPE, TYPE_NONE).trim();
++        type = (TYPE_IMAGE.equals(parsedType) || TYPE_VIDEO.equals(parsedType)) ? parsedType : TYPE_NONE;
++        path = props.getProperty(KEY_PATH, "").trim();
++        opacity = parseInt(props.getProperty(KEY_OPACITY), DEFAULT_OPACITY, 0, 100);
++        brightness = parseInt(props.getProperty(KEY_BRIGHTNESS), DEFAULT_BRIGHTNESS, 50, 150);
++        blur = parseInt(props.getProperty(KEY_BLUR), DEFAULT_BLUR, 0, 25);
++        String parsedScale = props.getProperty(KEY_SCALE, SCALE_CENTER_CROP).trim();
++        scale = SCALE_FIT_CENTER.equals(parsedScale) ? SCALE_FIT_CENTER : SCALE_CENTER_CROP;
++        overlay = parseInt(props.getProperty(KEY_OVERLAY), DEFAULT_OVERLAY, 0, 100);
++        int parsedFps = parseInt(props.getProperty(KEY_FPS), DEFAULT_FPS, 0, 60);
++        fps = (parsedFps == 15 || parsedFps == 24 || parsedFps == 30) ? parsedFps : 0;
++        amoled = Boolean.parseBoolean(props.getProperty(KEY_AMOLED, "false").trim());
++    }
++
++    /** The properties file that {@link #load()} reads from and {@link #update(Map)} writes to. */
++    public static File resolvePropertiesFile() {
++        File primary = TermuxConstants.TERMUX_PROPERTIES_PRIMARY_FILE;
++        if (primary.isFile()) return primary;
++        File secondary = TermuxConstants.TERMUX_PROPERTIES_SECONDARY_FILE;
++        if (secondary.isFile()) return secondary;
++        return primary;
++    }
++
++    /** Directory holding media files copied by the SannLab settings screen: {@code $HOME/.termux/sannlab/}. */
++    public static File getMediaDir() {
++        return new File(TermuxConstants.TERMUX_DATA_HOME_DIR, "sannlab");
++    }
++
++    public static SannLabConfig load() {
++        Properties props = new Properties();
++        File file = resolvePropertiesFile();
++        if (file.isFile()) {
++            try (FileInputStream in = new FileInputStream(file)) {
++                props.load(in);
++            } catch (IOException ignored) {
++                // Fall through with defaults; a broken properties file must never break the terminal.
++            }
++        }
++        return new SannLabConfig(props);
++    }
++
++    /**
++     * Update {@code sannlab.*} keys in the properties file in place. All other lines
++     * (comments and upstream keys) are preserved verbatim. Written via a temp file in
++     * the same directory followed by a rename, so a crash mid-write cannot truncate
++     * the user's properties file.
++     */
++    public static synchronized void update(Map<String, String> updates) throws IOException {
++        File file = resolvePropertiesFile();
++        File parent = file.getParentFile();
++        if (parent != null && !parent.exists() && !parent.mkdirs())
++            throw new IOException("Cannot create directory " + parent);
++
++        Map<String, String> pending = new LinkedHashMap<>(updates);
++        StringBuilder out = new StringBuilder();
++        if (file.isFile()) {
++            try (BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
++                String line;
++                while ((line = reader.readLine()) != null) {
++                    Matcher m = SANNLAB_KEY_LINE.matcher(line);
++                    if (m.matches() && pending.containsKey(m.group(1))) {
++                        String key = m.group(1);
++                        out.append(key).append("=").append(pending.remove(key)).append('\n');
++                    } else {
++                        out.append(line).append('\n');
++                    }
++                }
++            }
++        }
++        for (Map.Entry<String, String> entry : pending.entrySet()) {
++            out.append(entry.getKey()).append("=").append(entry.getValue()).append('\n');
++        }
++
++        File tmp = new File(parent, file.getName() + ".sannlab-tmp");
++        try (OutputStreamWriter writer = new OutputStreamWriter(new FileOutputStream(tmp), StandardCharsets.UTF_8)) {
++            writer.write(out.toString());
++        }
++        if (!tmp.renameTo(file)) {
++            // Rename across the same directory should never fail; fall back to a direct write.
++            try (OutputStreamWriter writer = new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8)) {
++                writer.write(out.toString());
++            }
++            //noinspection ResultOfMethodCallIgnored
++            tmp.delete();
++        }
++    }
++
++    private static int parseInt(String value, int defaultValue, int min, int max) {
++        if (value == null) return defaultValue;
++        try {
++            int parsed = Integer.parseInt(value.trim());
++            return Math.max(min, Math.min(max, parsed));
++        } catch (NumberFormatException e) {
++            return defaultValue;
++        }
++    }
++}
+diff --git a/termux-app/app/src/main/java/com/termux/app/sannlab/SannLabWallpaper.java b/termux-app/app/src/main/java/com/termux/app/sannlab/SannLabWallpaper.java
+new file mode 100644
+index 0000000..ad59c6d
+--- /dev/null
++++ b/termux-app/app/src/main/java/com/termux/app/sannlab/SannLabWallpaper.java
+@@ -0,0 +1,380 @@
++package com.termux.app.sannlab;
++
++import android.app.Activity;
++import android.graphics.Bitmap;
++import android.graphics.BitmapFactory;
++import android.graphics.Color;
++import android.graphics.ColorMatrix;
++import android.graphics.ColorMatrixColorFilter;
++import android.graphics.RenderEffect;
++import android.graphics.Shader;
++import android.net.Uri;
++import android.os.Build;
++import android.util.Log;
++import android.view.View;
++import android.widget.FrameLayout;
++import android.widget.ImageView;
++
++import androidx.media3.common.AudioAttributes;
++import androidx.media3.common.C;
++import androidx.media3.common.MediaItem;
++import androidx.media3.common.PlaybackException;
++import androidx.media3.common.Player;
++import androidx.media3.exoplayer.ExoPlayer;
++import androidx.media3.ui.AspectRatioFrameLayout;
++import androidx.media3.ui.PlayerView;
++
++import com.termux.app.R;
++
++import java.io.File;
++
++/**
++ * SannLab Studio wallpaper layer.
++ *
++ * <p>The views live in a container declared in {@code activity_termux.xml} as the first
++ * child of the root {@code RelativeLayout}, i.e. strictly behind the
++ * {@code DrawerLayout}/{@code TerminalView}. The terminal itself needs no patching for
++ * this to work: {@code TerminalView.onDraw()} only paints cell backgrounds and text -
++ * the visible terminal "background" is whatever shows through from behind the view -
++ * so as long as nothing opaque is painted over this layer, text and cursor render
++ * exactly as upstream intends.</p>
++ *
++ * <p>Modes (from {@link SannLabConfig}):</p>
++ * <ul>
++ *     <li>{@code none}: both media views hidden, container is a plain base color
++ *     (pure black when AMOLED is on; upstream window background otherwise untouched).</li>
++ *     <li>{@code image}: a downsampled bitmap with opacity/brightness/blur applied.</li>
++ *     <li>{@code video}: Media3/ExoPlayer playback (muted, looping, hardware decoding
++ *     by default), paused when the host activity stops and released when it is
++ *     destroyed. Any player/codec error falls back to a still image if one was
++ *     previously picked, otherwise to the static base color. The terminal never
++ *     crashes because of the wallpaper.</li>
++ * </ul>
++ *
++ * <p>The black overlay view always sits above the media (still inside the container,
++ * behind the terminal) to keep text readable.</p>
++ */
++public final class SannLabWallpaper {
++
++    private static final String LOG_TAG = "SannLabWallpaper";
++
++    /** Cap decoded bitmap dimensions so a huge wallpaper cannot OOM the app. */
++    private static final int MAX_BITMAP_DIMENSION = 2048;
++
++    private final Activity mActivity;
++    private final FrameLayout mContainer;
++    private final ImageView mImageView;
++    private final PlayerView mPlayerView;
++    private final View mOverlayView;
++
++    private SannLabConfig mConfig;
++    private ExoPlayer mPlayer;
++    private Bitmap mBitmap;
++    private String mLoadedImagePath;
++    private String mLoadedVideoPath;
++    /** Set when video playback failed and a still image is shown instead; cleared on refresh. */
++    private String mFallbackImagePath;
++    private int mApplyGeneration;
++
++    private SannLabWallpaper(Activity activity, FrameLayout container,
++                             ImageView imageView, PlayerView playerView, View overlayView) {
++        mActivity = activity;
++        mContainer = container;
++        mImageView = imageView;
++        mPlayerView = playerView;
++        mOverlayView = overlayView;
++        mPlayerView.setUseController(false);
++        mPlayerView.setShutterBackgroundColor(Color.TRANSPARENT);
++    }
++
++    /**
++     * Attach to the wallpaper container declared in the layout.
++     *
++     * @return the controller, or {@code null} when the layout does not contain the
++     * SannLab layer (defensive: the terminal must work even if the layout patch
++     * was not applied).
++     */
++    public static SannLabWallpaper attach(Activity activity) {
++        View container = activity.findViewById(R.id.sannlab_wallpaper_container);
++        View image = activity.findViewById(R.id.sannlab_wallpaper_image);
++        View video = activity.findViewById(R.id.sannlab_wallpaper_video);
++        View overlay = activity.findViewById(R.id.sannlab_wallpaper_overlay);
++        if (!(container instanceof FrameLayout) || !(image instanceof ImageView)
++            || !(video instanceof PlayerView) || overlay == null) {
++            Log.w(LOG_TAG, "SannLab wallpaper layer not present in layout; wallpaper disabled");
++            return null;
++        }
++        SannLabWallpaper wallpaper = new SannLabWallpaper(activity, (FrameLayout) container,
++            (ImageView) image, (PlayerView) video, overlay);
++        wallpaper.refresh();
++        return wallpaper;
++    }
++
++    /** Re-read the configuration from disk and re-apply everything. Cheap enough for onResume. */
++    public synchronized void refresh() {
++        mConfig = SannLabConfig.load();
++        mApplyGeneration++;
++        mFallbackImagePath = null;
++
++        // The base is always opaque black here: with AMOLED it is the required pure
++        // black; with a wallpaper it is what shows in letterbox areas. In the plain
++        // default configuration (no wallpaper, no AMOLED) the container is hidden
++        // entirely, so upstream's own background color (colors.properties via the
++        // decor view) shows through exactly as in stock Termux.
++        mContainer.setBackgroundColor(Color.BLACK);
++        boolean wallpaperActive = !SannLabConfig.TYPE_NONE.equals(mConfig.type);
++        mContainer.setVisibility(wallpaperActive || mConfig.amoled ? View.VISIBLE : View.GONE);
++        if (wallpaperActive || mConfig.amoled) {
++            mActivity.getWindow().getDecorView().setBackgroundColor(Color.BLACK);
++        }
++
++        mOverlayView.setAlpha(mConfig.overlay / 100f);
++        mOverlayView.setVisibility(wallpaperActive && mConfig.overlay > 0 ? View.VISIBLE : View.GONE);
++
++        switch (mConfig.type) {
++            case SannLabConfig.TYPE_IMAGE:
++                showImage();
++                break;
++            case SannLabConfig.TYPE_VIDEO:
++                showVideo();
++                break;
++            default:
++                mImageView.setVisibility(View.GONE);
++                mPlayerView.setVisibility(View.GONE);
++                releasePlayer();
++                recycleBitmap();
++                break;
++        }
++    }
++
++    /** Called from the host activity's onResume: re-apply config and resume video. */
++    public synchronized void onHostResume() {
++        refresh();
++        if (mConfig != null && SannLabConfig.TYPE_VIDEO.equals(mConfig.type) && mPlayer != null) {
++            mPlayer.play();
++        }
++    }
++
++    /** Called from the host activity's onStop: pause video so decoding stops off-screen. */
++    public synchronized void onHostPause() {
++        if (mPlayer != null) mPlayer.pause();
++    }
++
++    /** Called from the host activity's onDestroy: release all heavy resources. */
++    public synchronized void onHostRelease() {
++        mApplyGeneration++;
++        releasePlayer();
++        recycleBitmap();
++    }
++
++    // ------------------------------------------------------------------ image
++
++    private void showImage() {
++        releasePlayer();
++        mPlayerView.setVisibility(View.GONE);
++
++        File file = configuredMediaFile();
++        if (file == null) {
++            mImageView.setVisibility(View.GONE);
++            return;
++        }
++        mImageView.setVisibility(View.VISIBLE);
++        mImageView.setScaleType(SannLabConfig.SCALE_FIT_CENTER.equals(mConfig.scale)
++            ? ImageView.ScaleType.FIT_CENTER : ImageView.ScaleType.CENTER_CROP);
++        applyViewEffects(mImageView, true);
++
++        final String path = file.getAbsolutePath();
++        if (path.equals(mLoadedImagePath) && mBitmap != null) {
++            mImageView.setImageBitmap(mBitmap);
++            return;
++        }
++        final int generation = mApplyGeneration;
++        new Thread(() -> {
++            Bitmap decoded = decodeSampled(path, MAX_BITMAP_DIMENSION);
++            if (decoded == null) {
++                Log.w(LOG_TAG, "Could not decode wallpaper image: " + path);
++                return;
++            }
++            mImageView.post(() -> {
++                synchronized (SannLabWallpaper.this) {
++                    if (generation != mApplyGeneration) {
++                        decoded.recycle();
++                        return;
++                    }
++                    recycleBitmap();
++                    mBitmap = decoded;
++                    mLoadedImagePath = path;
++                    mImageView.setImageBitmap(decoded);
++                }
++            });
++        }, "sannlab-image-decode").start();
++    }
++
++    private static Bitmap decodeSampled(String path, int maxDimension) {
++        BitmapFactory.Options bounds = new BitmapFactory.Options();
++        bounds.inJustDecodeBounds = true;
++        BitmapFactory.decodeFile(path, bounds);
++        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
++        int sampleSize = 1;
++        while (bounds.outWidth / sampleSize > maxDimension || bounds.outHeight / sampleSize > maxDimension) {
++            sampleSize *= 2;
++        }
++        BitmapFactory.Options options = new BitmapFactory.Options();
++        options.inSampleSize = sampleSize;
++        return BitmapFactory.decodeFile(path, options);
++    }
++
++    // ------------------------------------------------------------------ video
++
++    private void showVideo() {
++        recycleBitmap();
++        mImageView.setVisibility(View.GONE);
++
++        File file = configuredMediaFile();
++        if (file == null) {
++            mPlayerView.setVisibility(View.GONE);
++            releasePlayer();
++            return;
++        }
++        mPlayerView.setVisibility(View.VISIBLE);
++        mPlayerView.setResizeMode(SannLabConfig.SCALE_FIT_CENTER.equals(mConfig.scale)
++            ? AspectRatioFrameLayout.RESIZE_MODE_FIT : AspectRatioFrameLayout.RESIZE_MODE_ZOOM);
++        applyViewEffects(mPlayerView, false);
++
++        if (!ensurePlayer()) return;
++
++        String path = file.getAbsolutePath();
++        try {
++            if (!path.equals(mLoadedVideoPath)) {
++                mPlayer.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)));
++                mPlayer.prepare();
++                mLoadedVideoPath = path;
++            }
++            mPlayer.setRepeatMode(Player.REPEAT_MODE_ONE);
++            mPlayer.play();
++        } catch (Exception e) {
++            Log.e(LOG_TAG, "Failed to start video wallpaper", e);
++            fallbackFromVideo();
++        }
++    }
++
++    private boolean ensurePlayer() {
++        if (mPlayer != null) return true;
++        try {
++            mPlayer = new ExoPlayer.Builder(mActivity).build();
++            // Muted by design: zero volume and never request audio focus, so the
++            // wallpaper cannot disturb music or calls playing on the device.
++            mPlayer.setVolume(0f);
++            mPlayer.setAudioAttributes(new AudioAttributes.Builder()
++                .setUsage(C.USAGE_MEDIA)
++                .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
++                .build(), false);
++            if (mConfig.fps > 0) {
++                // Frame-rate cap: constrains track selection to renditions at or
++                // below the requested fps. This is a selection constraint, not a
++                // hard render-time cap; see the plugin README for the exact limits.
++                mPlayer.setTrackSelectionParameters(mPlayer.getTrackSelectionParameters()
++                    .buildUpon().setMaxVideoFrameRate(mConfig.fps).build());
++            }
++            mPlayer.addListener(new Player.Listener() {
++                @Override
++                public void onPlayerError(PlaybackException error) {
++                    Log.e(LOG_TAG, "Video wallpaper playback error: " + error.getMessage());
++                    synchronized (SannLabWallpaper.this) {
++                        fallbackFromVideo();
++                    }
++                }
++            });
++            mPlayerView.setPlayer(mPlayer);
++            return true;
++        } catch (Exception e) {
++            Log.e(LOG_TAG, "Failed to create ExoPlayer for video wallpaper", e);
++            mPlayer = null;
++            return false;
++        }
++    }
++
++    /** Codec/decoder failure path: still image if one exists, else static base. Never throws. */
++    private void fallbackFromVideo() {
++        releasePlayer();
++        mPlayerView.setVisibility(View.GONE);
++        File image = findPickedImageFile();
++        if (image != null) {
++            mFallbackImagePath = image.getAbsolutePath();
++            showImage();
++        }
++    }
++
++    private void releasePlayer() {
++        if (mPlayer != null) {
++            try {
++                mPlayerView.setPlayer(null);
++                mPlayer.release();
++            } catch (Exception ignored) {
++            }
++            mPlayer = null;
++        }
++        mLoadedVideoPath = null;
++    }
++
++    // ------------------------------------------------------------------ shared helpers
++
++    /** Opacity for both media views; brightness color filter and blur where the view supports them. */
++    private void applyViewEffects(View view, boolean isImageView) {
++        view.setAlpha(mConfig.opacity / 100f);
++        if (isImageView) {
++            float brightness = mConfig.brightness / 100f;
++            if (brightness == 1f) {
++                mImageView.clearColorFilter();
++            } else {
++                ColorMatrix matrix = new ColorMatrix(new float[]{
++                    brightness, 0, 0, 0, 0,
++                    0, brightness, 0, 0, 0,
++                    0, 0, brightness, 0, 0,
++                    0, 0, 0, 1, 0
++                });
++                mImageView.setColorFilter(new ColorMatrixColorFilter(matrix));
++            }
++        }
++        applyBlur(view);
++    }
++
++    private void applyBlur(View view) {
++        // RenderEffect blur requires API 31 (Android 12). On older devices the blur
++        // setting is ignored by design (documented in the plugin README); the rest
++        // of the effects pipeline is unaffected.
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
++            if (mConfig.blur > 0) {
++                view.setRenderEffect(RenderEffect.createBlurEffect(
++                    mConfig.blur, mConfig.blur, Shader.TileMode.CLAMP));
++            } else {
++                view.setRenderEffect(null);
++            }
++        }
++    }
++
++    private File configuredMediaFile() {
++        String path = mFallbackImagePath != null ? mFallbackImagePath : mConfig.path;
++        if (path == null || path.isEmpty()) return null;
++        File file = new File(path);
++        return file.isFile() ? file : null;
++    }
++
++    /** A previously picked image (background_image.*) in the SannLab media dir, if any. */
++    private File findPickedImageFile() {
++        File[] files = SannLabConfig.getMediaDir().listFiles();
++        if (files == null) return null;
++        for (File file : files) {
++            if (file.isFile() && file.getName().startsWith("background_image.")) return file;
++        }
++        return null;
++    }
++
++    private void recycleBitmap() {
++        if (mBitmap != null) {
++            mBitmap.recycle();
++            mBitmap = null;
++        }
++        mLoadedImagePath = null;
++    }
++}
+diff --git a/termux-app/app/src/main/res/layout/activity_termux.xml b/termux-app/app/src/main/res/layout/activity_termux.xml
+index 831ea7c..e11d917 100644
+--- a/termux-app/app/src/main/res/layout/activity_termux.xml
++++ b/termux-app/app/src/main/res/layout/activity_termux.xml
+@@ -16,6 +16,41 @@
+         android:layout_marginVertical="0dp"
+         android:orientation="vertical">
+ 
++        <!-- SannLab Studio wallpaper layer: always behind the DrawerLayout/TerminalView.
++             The terminal view does not paint a background, so this layer shows through. -->
++        <FrameLayout
++            android:id="@+id/sannlab_wallpaper_container"
++            android:layout_width="match_parent"
++            android:layout_height="match_parent"
++            android:background="#000000">
++
++            <ImageView
++                android:id="@+id/sannlab_wallpaper_image"
++                android:layout_width="match_parent"
++                android:layout_height="match_parent"
++                android:contentDescription="@null"
++                android:visibility="gone" />
++
++            <androidx.media3.ui.PlayerView
++                android:id="@+id/sannlab_wallpaper_video"
++                android:layout_width="match_parent"
++                android:layout_height="match_parent"
++                android:visibility="gone"
++                app:resize_mode="zoom"
++                app:shutter_background_color="#000000"
++                app:surface_type="texture_view"
++                app:use_controller="false" />
++
++            <View
++                android:id="@+id/sannlab_wallpaper_overlay"
++                android:layout_width="match_parent"
++                android:layout_height="match_parent"
++                android:alpha="0"
++                android:background="#000000"
++                android:visibility="gone" />
++
++        </FrameLayout>
++
+         <androidx.drawerlayout.widget.DrawerLayout
+             android:id="@+id/drawer_layout"
+             android:layout_width="match_parent"
+-- 
+2.43.0
+

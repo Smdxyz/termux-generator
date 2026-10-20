@@ -1,0 +1,421 @@
+From eb1dadfeae11ed4091d9873398654acec11a7db3 Mon Sep 17 00:00:00 2001
+From: SannLab Studio <sannlab@local>
+Date: Tue, 20 Oct 2026 13:48:37 +0000
+Subject: [PATCH 3/3] feat(sannlab): appearance settings activity + context
+ menu entry
+
+- SannLabSettingsActivity (AppCompatActivity, exported=false, no new
+  permissions): system document pickers for image/video/font, copies picks
+  into app-owned storage ($HOME/.termux/sannlab/ and the standard
+  $HOME/.termux/font.ttf for fonts), sliders for opacity/overlay/brightness/
+  blur, scale and video fps radio groups, AMOLED switch. All changes are
+  written to termux.properties immediately via SannLabConfig.
+- AndroidManifest: declare the settings activity.
+- TermuxActivity: 'SannLab Wallpaper' entry in the terminal long-press
+  context menu.
+---
+ termux-app/app/src/main/AndroidManifest.xml   |   6 +
+ .../java/com/termux/app/TermuxActivity.java   |   6 +
+ .../app/sannlab/SannLabSettingsActivity.java  | 335 ++++++++++++++++++
+ 3 files changed, 347 insertions(+)
+ create mode 100644 termux-app/app/src/main/java/com/termux/app/sannlab/SannLabSettingsActivity.java
+
+diff --git a/termux-app/app/src/main/AndroidManifest.xml b/termux-app/app/src/main/AndroidManifest.xml
+index 1d0dfe1..fe8e5f1 100644
+--- a/termux-app/app/src/main/AndroidManifest.xml
++++ b/termux-app/app/src/main/AndroidManifest.xml
+@@ -102,6 +102,12 @@
+             android:label="@string/title_activity_termux_settings"
+             android:theme="@style/Theme.TermuxApp.DayNight.NoActionBar" />
+ 
++        <activity
++            android:name=".app.sannlab.SannLabSettingsActivity"
++            android:exported="false"
++            android:label="SannLab Wallpaper"
++            android:theme="@style/Theme.TermuxApp.DayNight.NoActionBar" />
++
+         <activity
+             android:name=".shared.activities.ReportActivity"
+             android:theme="@style/Theme.MarkdownViewActivity.DayNight"
+diff --git a/termux-app/app/src/main/java/com/termux/app/TermuxActivity.java b/termux-app/app/src/main/java/com/termux/app/TermuxActivity.java
+index 5886908..5c79bed 100644
+--- a/termux-app/app/src/main/java/com/termux/app/TermuxActivity.java
++++ b/termux-app/app/src/main/java/com/termux/app/TermuxActivity.java
+@@ -28,6 +28,7 @@ import android.widget.Toast;
+ 
+ import com.termux.R;
+ import com.termux.app.api.file.FileReceiverActivity;
++import com.termux.app.sannlab.SannLabSettingsActivity;
+ import com.termux.app.sannlab.SannLabWallpaper;
+ import com.termux.app.terminal.TermuxActivityRootView;
+ import com.termux.app.terminal.TermuxTerminalSessionActivityClient;
+@@ -188,6 +189,7 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
+     private static final int CONTEXT_MENU_RESET_TERMINAL_ID = 3;
+     private static final int CONTEXT_MENU_KILL_PROCESS_ID = 4;
+     private static final int CONTEXT_MENU_STYLING_ID = 5;
++    private static final int CONTEXT_MENU_SANNLAB_WALLPAPER_ID = 1001;
+     private static final int CONTEXT_MENU_TOGGLE_KEEP_SCREEN_ON = 6;
+     private static final int CONTEXT_MENU_HELP_ID = 7;
+     private static final int CONTEXT_MENU_SETTINGS_ID = 8;
+@@ -663,6 +665,7 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
+         menu.add(Menu.NONE, CONTEXT_MENU_RESET_TERMINAL_ID, Menu.NONE, R.string.action_reset_terminal);
+         menu.add(Menu.NONE, CONTEXT_MENU_KILL_PROCESS_ID, Menu.NONE, getResources().getString(R.string.action_kill_process, getCurrentSession().getPid())).setEnabled(currentSession.isRunning());
+         menu.add(Menu.NONE, CONTEXT_MENU_STYLING_ID, Menu.NONE, R.string.action_style_terminal);
++        menu.add(Menu.NONE, CONTEXT_MENU_SANNLAB_WALLPAPER_ID, Menu.NONE, "SannLab Wallpaper");
+         menu.add(Menu.NONE, CONTEXT_MENU_TOGGLE_KEEP_SCREEN_ON, Menu.NONE, R.string.action_toggle_keep_screen_on).setCheckable(true).setChecked(mPreferences.shouldKeepScreenOn());
+         menu.add(Menu.NONE, CONTEXT_MENU_HELP_ID, Menu.NONE, R.string.action_open_help);
+         menu.add(Menu.NONE, CONTEXT_MENU_SETTINGS_ID, Menu.NONE, R.string.action_open_settings);
+@@ -705,6 +708,9 @@ public final class TermuxActivity extends AppCompatActivity implements ServiceCo
+             case CONTEXT_MENU_STYLING_ID:
+                 showStylingDialog();
+                 return true;
++            case CONTEXT_MENU_SANNLAB_WALLPAPER_ID:
++                startActivity(new Intent(this, SannLabSettingsActivity.class));
++                return true;
+             case CONTEXT_MENU_TOGGLE_KEEP_SCREEN_ON:
+                 toggleKeepScreenOn();
+                 return true;
+diff --git a/termux-app/app/src/main/java/com/termux/app/sannlab/SannLabSettingsActivity.java b/termux-app/app/src/main/java/com/termux/app/sannlab/SannLabSettingsActivity.java
+new file mode 100644
+index 0000000..be4df55
+--- /dev/null
++++ b/termux-app/app/src/main/java/com/termux/app/sannlab/SannLabSettingsActivity.java
+@@ -0,0 +1,335 @@
++package com.termux.app.sannlab;
++
++import android.content.ContentResolver;
++import android.graphics.Typeface;
++import android.net.Uri;
++import android.os.Bundle;
++import android.view.Gravity;
++import android.view.View;
++import android.view.ViewGroup;
++import android.webkit.MimeTypeMap;
++import android.widget.Button;
++import android.widget.LinearLayout;
++import android.widget.RadioButton;
++import android.widget.RadioGroup;
++import android.widget.ScrollView;
++import android.widget.SeekBar;
++import android.widget.TextView;
++import android.widget.Toast;
++
++import androidx.activity.result.ActivityResultLauncher;
++import androidx.activity.result.contract.ActivityResultContracts;
++import androidx.appcompat.app.AppCompatActivity;
++import androidx.appcompat.widget.SwitchCompat;
++
++import com.termux.shared.termux.TermuxConstants;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.util.HashMap;
++import java.util.Map;
++
++/**
++ * SannLab Studio appearance settings.
++ *
++ * <p>A deliberately simple, fully programmatic settings screen (v1): no layout
++ * XML, no new Android permissions. Files are chosen with the system document
++ * picker ({@link ActivityResultContracts.OpenDocument}); the picker grant is the
++ * only access used. Picks are copied into app-owned storage:</p>
++ * <ul>
++ *     <li>background image/video → {@code $HOME/.termux/sannlab/} and the choice is
++ *     persisted as {@code sannlab.*} keys in {@code termux.properties}</li>
++ *     <li>font → {@code $HOME/.termux/font.ttf}, the exact file upstream's
++ *     {@code checkForFontAndColors()} loads, so the existing Termux font mechanism
++ *     applies it (on the terminal activity's next resume)</li>
++ * </ul>
++ *
++ * <p>Every change is written to the properties file immediately; the terminal
++ * re-reads it in {@code onResume}, so changes take effect when the user returns
++ * to the terminal, without restarting the app.</p>
++ */
++public class SannLabSettingsActivity extends AppCompatActivity {
++
++    private TextView mStatusText;
++    private ActivityResultLauncher<String[]> mImagePicker;
++    private ActivityResultLauncher<String[]> mVideoPicker;
++    private ActivityResultLauncher<String[]> mFontPicker;
++
++    @Override
++    protected void onCreate(Bundle savedInstanceState) {
++        super.onCreate(savedInstanceState);
++
++        mImagePicker = registerForActivityResult(new ActivityResultContracts.OpenDocument(),
++            uri -> { if (uri != null) copyPickedMedia(uri, false); });
++        mVideoPicker = registerForActivityResult(new ActivityResultContracts.OpenDocument(),
++            uri -> { if (uri != null) copyPickedMedia(uri, true); });
++        mFontPicker = registerForActivityResult(new ActivityResultContracts.OpenDocument(),
++            uri -> { if (uri != null) copyPickedFont(uri); });
++
++        SannLabConfig config = SannLabConfig.load();
++
++        LinearLayout root = new LinearLayout(this);
++        root.setOrientation(LinearLayout.VERTICAL);
++        int pad = dp(16);
++        root.setPadding(pad, pad, pad, pad);
++
++        TextView title = new TextView(this);
++        title.setText("SannLab Studio — Wallpaper & Appearance");
++        title.setTextSize(18);
++        title.setPadding(0, 0, 0, dp(4));
++        root.addView(title);
++
++        mStatusText = new TextView(this);
++        mStatusText.setPadding(0, 0, 0, dp(12));
++        root.addView(mStatusText);
++
++        root.addView(makeButton("Pick background image (JPG/PNG/WebP)",
++            v -> mImagePicker.launch(new String[]{"image/*"})));
++        root.addView(makeButton("Pick background video (MP4/WebM)",
++            v -> mVideoPicker.launch(new String[]{"video/*"})));
++        root.addView(makeButton("Pick terminal font (.ttf/.otf)",
++            v -> mFontPicker.launch(new String[]{"*/*"})));
++        root.addView(makeButton("No background (plain terminal)",
++            v -> applyUpdates(singleEntry(SannLabConfig.KEY_TYPE, SannLabConfig.TYPE_NONE),
++                "Background disabled")));
++
++        addSlider(root, "Wallpaper opacity", 0, 100, config.opacity, value ->
++            applyUpdates(singleEntry(SannLabConfig.KEY_OPACITY, String.valueOf(value)), null));
++        addSlider(root, "Black overlay (readability)", 0, 100, config.overlay, value ->
++            applyUpdates(singleEntry(SannLabConfig.KEY_OVERLAY, String.valueOf(value)), null));
++        // SeekBar range is 0..100; brightness maps to 50..150 percent.
++        addSlider(root, "Brightness", 0, 100, config.brightness - 50, value ->
++            applyUpdates(singleEntry(SannLabConfig.KEY_BRIGHTNESS, String.valueOf(value + 50)), null));
++        addSlider(root, "Blur radius (Android 12+ only)", 0, 25, config.blur, value ->
++            applyUpdates(singleEntry(SannLabConfig.KEY_BLUR, String.valueOf(value)), null));
++
++        TextView scaleLabel = new TextView(this);
++        scaleLabel.setText("Scaling");
++        scaleLabel.setPadding(0, dp(12), 0, 0);
++        root.addView(scaleLabel);
++        RadioGroup scaleGroup = new RadioGroup(this);
++        scaleGroup.setOrientation(RadioGroup.HORIZONTAL);
++        RadioButton crop = new RadioButton(this);
++        crop.setText("Center crop");
++        RadioButton fit = new RadioButton(this);
++        fit.setText("Fit center");
++        scaleGroup.addView(crop);
++        scaleGroup.addView(fit);
++        (SannLabConfig.SCALE_FIT_CENTER.equals(config.scale) ? fit : crop).setChecked(true);
++        scaleGroup.setOnCheckedChangeListener((group, checkedId) ->
++            applyUpdates(singleEntry(SannLabConfig.KEY_SCALE,
++                checkedId == fit.getId() ? SannLabConfig.SCALE_FIT_CENTER : SannLabConfig.SCALE_CENTER_CROP), null));
++        root.addView(scaleGroup);
++
++        TextView fpsLabel = new TextView(this);
++        fpsLabel.setText("Video frame-rate cap");
++        fpsLabel.setPadding(0, dp(12), 0, 0);
++        root.addView(fpsLabel);
++        RadioGroup fpsGroup = new RadioGroup(this);
++        fpsGroup.setOrientation(RadioGroup.HORIZONTAL);
++        int[] fpsValues = {0, 15, 24, 30};
++        String[] fpsLabels = {"Off", "15", "24", "30"};
++        RadioButton[] fpsButtons = new RadioButton[fpsValues.length];
++        for (int i = 0; i < fpsValues.length; i++) {
++            fpsButtons[i] = new RadioButton(this);
++            fpsButtons[i].setText(fpsLabels[i]);
++            final int fpsValue = fpsValues[i];
++            fpsButtons[i].setTag(fpsValue);
++            fpsGroup.addView(fpsButtons[i]);
++            if (config.fps == fpsValue) fpsButtons[i].setChecked(true);
++        }
++        if (config.fps == 0) fpsButtons[0].setChecked(true);
++        fpsGroup.setOnCheckedChangeListener((group, checkedId) -> {
++            RadioButton selected = group.findViewById(checkedId);
++            if (selected != null && selected.getTag() instanceof Integer)
++                applyUpdates(singleEntry(SannLabConfig.KEY_FPS, String.valueOf(selected.getTag())), null);
++        });
++        root.addView(fpsGroup);
++
++        SwitchCompat amoledSwitch = new SwitchCompat(this);
++        amoledSwitch.setText("AMOLED pure black (#000000)");
++        amoledSwitch.setPadding(0, dp(16), 0, 0);
++        amoledSwitch.setChecked(config.amoled);
++        amoledSwitch.setOnCheckedChangeListener((button, isChecked) ->
++            applyUpdates(singleEntry(SannLabConfig.KEY_AMOLED, String.valueOf(isChecked)), null));
++        root.addView(amoledSwitch);
++
++        TextView hint = new TextView(this);
++        hint.setText("Changes are saved to termux.properties immediately and apply when you " +
++            "return to the terminal. The font applies through the standard Termux font " +
++            "mechanism (font.ttf). Video wallpaper is muted and pauses automatically " +
++            "when the terminal is not visible.");
++        hint.setPadding(0, dp(16), 0, 0);
++        root.addView(hint);
++
++        ScrollView scrollView = new ScrollView(this);
++        scrollView.addView(root);
++        setContentView(scrollView);
++
++        refreshStatus();
++    }
++
++    // ------------------------------------------------------------------ picking & copying
++
++    private void copyPickedMedia(Uri uri, boolean isVideo) {
++        new Thread(() -> {
++            try {
++                String extension = extensionFor(uri, isVideo ? "mp4" : "jpg");
++                File dir = SannLabConfig.getMediaDir();
++                if (!dir.exists() && !dir.mkdirs()) throw new IOException("Cannot create " + dir);
++                String baseName = isVideo ? "background_video." : "background_image.";
++                // Remove a previously picked file of the same kind so stale files
++                // (also used by the video error fallback) cannot linger.
++                File[] existing = dir.listFiles();
++                if (existing != null) {
++                    for (File f : existing) {
++                        if (f.getName().startsWith(baseName)) {
++                            //noinspection ResultOfMethodCallIgnored
++                            f.delete();
++                        }
++                    }
++                }
++                File target = new File(dir, baseName + extension);
++                copyUriToFile(uri, target);
++                Map<String, String> updates = new HashMap<>();
++                updates.put(SannLabConfig.KEY_TYPE, isVideo ? SannLabConfig.TYPE_VIDEO : SannLabConfig.TYPE_IMAGE);
++                updates.put(SannLabConfig.KEY_PATH, target.getAbsolutePath());
++                SannLabConfig.update(updates);
++                runOnUiThread(() -> {
++                    refreshStatus();
++                    toast((isVideo ? "Video" : "Image") + " background saved");
++                });
++            } catch (Exception e) {
++                runOnUiThread(() -> toast("Failed to save background: " + e.getMessage()));
++            }
++        }, "sannlab-copy-media").start();
++    }
++
++    private void copyPickedFont(Uri uri) {
++        String name = uri.getLastPathSegment();
++        String lower = name == null ? "" : name.toLowerCase();
++        if (!lower.endsWith(".ttf") && !lower.endsWith(".otf")) {
++            toast("Please pick a .ttf or .otf font file");
++            return;
++        }
++        new Thread(() -> {
++            try {
++                File target = TermuxConstants.TERMUX_FONT_FILE;
++                File parent = target.getParentFile();
++                if (parent != null && !parent.exists() && !parent.mkdirs())
++                    throw new IOException("Cannot create " + parent);
++                copyUriToFile(uri, target);
++                // Sanity check with the same API upstream uses to load the font.
++                if (Typeface.createFromFile(target) == null)
++                    throw new IOException("Font file could not be parsed");
++                runOnUiThread(() -> toast("Font saved — applies when the terminal reloads"));
++            } catch (Exception e) {
++                runOnUiThread(() -> toast("Failed to save font: " + e.getMessage()));
++            }
++        }, "sannlab-copy-font").start();
++    }
++
++    private void copyUriToFile(Uri uri, File target) throws IOException {
++        ContentResolver resolver = getContentResolver();
++        try (InputStream in = resolver.openInputStream(uri);
++             OutputStream out = new FileOutputStream(target)) {
++            if (in == null) throw new IOException("Cannot open " + uri);
++            byte[] buffer = new byte[64 * 1024];
++            int read;
++            while ((read = in.read(buffer)) != -1) {
++                out.write(buffer, 0, read);
++            }
++        }
++    }
++
++    private String extensionFor(Uri uri, String fallback) {
++        String mime = getContentResolver().getType(uri);
++        String ext = mime == null ? null : MimeTypeMap.getSingleton().getExtensionFromMimeType(mime);
++        if (ext == null || ext.isEmpty()) {
++            String segment = uri.getLastPathSegment();
++            if (segment != null) {
++                int dot = segment.lastIndexOf('.');
++                if (dot >= 0 && dot < segment.length() - 1) ext = segment.substring(dot + 1);
++            }
++        }
++        return (ext == null || ext.isEmpty()) ? fallback : ext.toLowerCase();
++    }
++
++    // ------------------------------------------------------------------ helpers
++
++    private interface SliderListener {
++        void onValue(int value);
++    }
++
++    private void addSlider(LinearLayout root, String label, int min, int max, int value, SliderListener listener) {
++        TextView labelView = new TextView(this);
++        labelView.setText(label + ": " + (label.startsWith("Brightness") ? (value + 50) : value));
++        labelView.setPadding(0, dp(12), 0, 0);
++        root.addView(labelView);
++
++        SeekBar seekBar = new SeekBar(this);
++        seekBar.setMax(max - min);
++        seekBar.setProgress(value - min);
++        seekBar.setLayoutParams(new LinearLayout.LayoutParams(
++            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
++        seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
++            @Override
++            public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
++                int v = progress + min;
++                labelView.setText(label + ": " + (label.startsWith("Brightness") ? (v + 50) : v));
++            }
++
++            @Override
++            public void onStartTrackingTouch(SeekBar bar) {
++            }
++
++            @Override
++            public void onStopTrackingTouch(SeekBar bar) {
++                listener.onValue(bar.getProgress() + min);
++            }
++        });
++        root.addView(seekBar);
++    }
++
++    private Button makeButton(String text, View.OnClickListener listener) {
++        Button button = new Button(this);
++        button.setText(text);
++        button.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
++        button.setOnClickListener(listener);
++        return button;
++    }
++
++    private Map<String, String> singleEntry(String key, String value) {
++        Map<String, String> map = new HashMap<>();
++        map.put(key, value);
++        return map;
++    }
++
++    private void applyUpdates(Map<String, String> updates, String toastMessage) {
++        try {
++            SannLabConfig.update(updates);
++            refreshStatus();
++            if (toastMessage != null) toast(toastMessage);
++        } catch (IOException e) {
++            toast("Failed to save settings: " + e.getMessage());
++        }
++    }
++
++    private void refreshStatus() {
++        SannLabConfig config = SannLabConfig.load();
++        String path = config.path.isEmpty() ? "(none)" : config.path;
++        mStatusText.setText("Type: " + config.type + "  •  AMOLED: " + (config.amoled ? "on" : "off")
++            + "\nFile: " + path);
++    }
++
++    private void toast(String message) {
++        Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
++    }
++
++    private int dp(int value) {
++        return Math.round(value * getResources().getDisplayMetrics().density);
++    }
++}
+-- 
+2.43.0
+

@@ -1,5 +1,11 @@
 # Changelog — SannLab Studio
 
+## 2026-10-21 — Versi SUPER LITE difinalkan
+
+- List `--add` final: `nodejs,python,python-pip,git,openssh,curl,jq,tmux,termux-api,sannlab-tools`
+  (wget dicabut — curl cukup; unzip memang paket inti). Ini list yang
+  diisikan ke form workflow; sisanya paket inti bawaan generator.
+
 ## 2026-10-21 — List `--add` dipangkas (keputusan user)
 
 - **ffmpeg + toolchain clang DICABUT dari bootstrap.** List final:

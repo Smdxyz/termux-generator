@@ -8,7 +8,7 @@ di fork `Smdxyz/termux-generator` (tab Actions → Run workflow).
 | Input | Nilai | Alasan |
 |---|---|---|
 | Choose a name for the new application | `sann.lab.studio` | Application ID final; lulus `check_names()` generator |
-| Add additional packages to include in bootstrap | `nodejs,python,python-pip,git,openssh,curl,wget,unzip,jq,tmux,termux-api,sannlab-tools` | Runtime inti + utilitas + **sannlab-tools** (paket SannLab dari plugin ini). ffmpeg + toolchain SENGAJA dicabut (keputusan 2026-10-21, lihat Konsekuensi) |
+| Add additional packages to include in bootstrap | `nodejs,python,python-pip,git,openssh,curl,jq,tmux,termux-api,sannlab-tools` | VERSI SUPER LITE (2026-10-21): runtime inti + utilitas seperlunya + **sannlab-tools**. ffmpeg + toolchain + wget dicabut; unzip sudah termasuk paket inti bootstrap |
 | Choose target architectures | `aarch64` | Redmi Note 12 Pro 5G (ARM64) saja — build lebih cepat |
 | Enter a plugin name (optional) | `sannlab-studio` | Mengaktifkan patch dari `plugins/sannlab-studio/` (tampilan + paket sannlab-tools) |
 | Generate the main Terminal application | ✅ true | Inti |

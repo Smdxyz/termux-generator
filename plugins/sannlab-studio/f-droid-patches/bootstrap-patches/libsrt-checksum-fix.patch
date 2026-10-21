@@ -1,0 +1,23 @@
+SannLab: perbarui checksum source libsrt 1.5.7.
+
+GitHub meregenerasi arsip auto-generated untuk tag v1.5.7 sehingga
+SHA256 tarball yang disajikan sekarang berubah:
+  lama (resep upstream): fee6aee6b4933f01ba8b7e18d5d9e4896ad604053fdad2ac55df4a4f1561f30a
+  baru (terverifikasi):  017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b
+Isi tarball baru terverifikasi IDENTIK dengan git tag v1.5.7
+(diff -r terhadap clone tag bersih; SRT_VERSION 1.5.7).
+Patch ini gugur dengan sendirinya bila upstream memperbarui checksum-nya.
+
+diff --git a/packages/libsrt/build.sh b/packages/libsrt/build.sh
+index a168dcb..f9dea0e 100644
+--- a/packages/libsrt/build.sh
++++ b/packages/libsrt/build.sh
+@@ -4,7 +4,7 @@ TERMUX_PKG_LICENSE="MPL-2.0"
+ TERMUX_PKG_MAINTAINER="@termux"
+ TERMUX_PKG_VERSION="1.5.7"
+ TERMUX_PKG_SRCURL=https://github.com/Haivision/srt/archive/refs/tags/v${TERMUX_PKG_VERSION}.tar.gz
+-TERMUX_PKG_SHA256=fee6aee6b4933f01ba8b7e18d5d9e4896ad604053fdad2ac55df4a4f1561f30a
++TERMUX_PKG_SHA256=017cd1e437ef2073a4dd10ddf7b55e86bc3d6ebac0393d13bd22f6a57055d32b
+ TERMUX_PKG_AUTO_UPDATE=true
+ TERMUX_PKG_DEPENDS="libc++, openssl"
+ TERMUX_PKG_FORCE_CMAKE=true

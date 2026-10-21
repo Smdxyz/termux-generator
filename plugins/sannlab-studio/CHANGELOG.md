@@ -1,5 +1,17 @@
 # Changelog — SannLab Studio
 
+## 2026-10-21 — Fix build run-4: checksum libsrt
+
+- **Patch bootstrap baru `libsrt-checksum-fix.patch`:** GitHub meregenerasi
+  arsip tag v1.5.7 libsrt → SHA256 tarball berubah dari yang tercatat di
+  resep upstream (`fee6aee6…` → `017cd1e4…`); build ffmpeg mati di
+  "Wrong checksum". Isi tarball baru terverifikasi identik dengan git tag
+  v1.5.7 (diff -r bersih). Patch memperbarui `TERMUX_PKG_SHA256` libsrt;
+  gugur dengan sendirinya bila upstream memperbarui checksum-nya.
+- Run-4 sendiri membuktikan: bootstrap inti selesai (apt + termux-tools
+  DONE — fix `TERMUX_APP__USER_PATH` terbukti end-to-end), nodejs, python,
+  git, openssh DONE; mati di rantai dependensi ffmpeg setelah ±4,5 jam.
+
 ## 2026-10-20 — Fondasi & inti (branch `sannlab-studio`)
 
 - **Fase 6+7 (fondasi):** `BUILD-CONFIG.md` — input final workflow GitHub

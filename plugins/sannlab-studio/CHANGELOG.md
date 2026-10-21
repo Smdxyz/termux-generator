@@ -1,5 +1,15 @@
 # Changelog — SannLab Studio
 
+## 2026-10-21 — List `--add` dipangkas (keputusan user)
+
+- **ffmpeg + toolchain clang DICABUT dari bootstrap.** List final:
+  `nodejs,python,python-pip,git,openssh,curl,wget,unzip,jq,tmux,termux-api,sannlab-tools`.
+  Bukti run-4: list lama mustahil muat di batas 6 jam/job Actions
+  (inti ±1 jam; rantai nodejs ±2,5 jam; ffmpeg baru mulai jam ke-4,5;
+  libllvm + Gradle APK belum tersentuh). Bootstrap cukup berisi kebutuhan
+  boot pertama; sisanya bukan kewajiban bake. Konsekuensi tercatat di
+  BUILD-CONFIG.md.
+
 ## 2026-10-21 — Fix build run-4: checksum libsrt
 
 - **Patch bootstrap baru `libsrt-checksum-fix.patch`:** GitHub meregenerasi

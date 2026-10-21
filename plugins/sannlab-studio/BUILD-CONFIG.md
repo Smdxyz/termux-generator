@@ -8,7 +8,7 @@ di fork `Smdxyz/termux-generator` (tab Actions → Run workflow).
 | Input | Nilai | Alasan |
 |---|---|---|
 | Choose a name for the new application | `sann.lab.studio` | Application ID final; lulus `check_names()` generator |
-| Add additional packages to include in bootstrap | `nodejs,python,python-pip,git,openssh,ffmpeg,clang,make,pkg-config,cmake,autoconf,automake,libtool,curl,wget,unzip,jq,tmux,termux-api,sannlab-tools` | Runtime inti + toolchain native + utilitas + **sannlab-tools** (paket SannLab dari plugin ini) |
+| Add additional packages to include in bootstrap | `nodejs,python,python-pip,git,openssh,curl,wget,unzip,jq,tmux,termux-api,sannlab-tools` | Runtime inti + utilitas + **sannlab-tools** (paket SannLab dari plugin ini). ffmpeg + toolchain SENGAJA dicabut (keputusan 2026-10-21, lihat Konsekuensi) |
 | Choose target architectures | `aarch64` | Redmi Note 12 Pro 5G (ARM64) saja — build lebih cepat |
 | Enter a plugin name (optional) | `sannlab-studio` | Mengaktifkan patch dari `plugins/sannlab-studio/` (tampilan + paket sannlab-tools) |
 | Generate the main Terminal application | ✅ true | Inti |
@@ -24,9 +24,15 @@ di fork `Smdxyz/termux-generator` (tab Actions → Run workflow).
 
 ## Konsekuensi yang diketahui & diterima
 
-- Toolchain (`clang`, `cmake`, dll.) membuat bootstrap lebih besar dan waktu build
-  Actions lebih lama dari baseline. Ini harga yang dibayar sekali agar native module
-  (sharp dll.) bisa di-compile di perangkat (Fase 3).
+- **2026-10-21 — ffmpeg + toolchain DICABUT dari bootstrap** (keputusan user):
+  run-4 membuktikan list lama tidak muat di batas 6 jam/job GitHub Actions
+  (bootstrap inti ±1 jam, rantai nodejs ±2,5 jam, ffmpeg baru mulai di jam
+  ke-4,5; clang/libllvm + tahap APK belum tersentuh). Bootstrap hanya wajib
+  berisi yang harus ada sejak boot pertama. Konsekuensi yang diterima sadar:
+  ffmpeg dan compiler TIDAK ada di perangkat dari build ini; paket biner repo
+  resmi Termux terkunci ke prefix `com.termux` sehingga bukan pengganti
+  drop-in; resep doctor Fase 3 yang butuh compiler ditunda sampai ada jalur
+  bake terpisah. Runtime Node/Python untuk kerja harian tidak terpengaruh.
 - `sannlab-tools` adalah paket skrip (noarch) yang ditambahkan plugin ini ke
   termux-packages lewat bootstrap-patch. Sumbernya hidup di
   `plugins/sannlab-studio/sannlab-tools/` dalam repo ini dan disalin persis ke paket.

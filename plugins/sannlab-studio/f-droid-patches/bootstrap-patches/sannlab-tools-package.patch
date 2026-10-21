@@ -1,9 +1,9 @@
 diff --git a/packages/sannlab-tools/build.sh b/packages/sannlab-tools/build.sh
 new file mode 100644
-index 0000000..fd73778
+index 0000000..40677f8
 --- /dev/null
 +++ b/packages/sannlab-tools/build.sh
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,25 @@
 +TERMUX_PKG_HOMEPAGE="https://github.com/Smdxyz/termux-generator"
 +TERMUX_PKG_DESCRIPTION="SannLab Studio tools: smart Node workspace manager, native module doctor, terminal helpers"
 +TERMUX_PKG_LICENSE="MIT"
@@ -13,6 +13,15 @@ index 0000000..fd73778
 +TERMUX_PKG_DEPENDS="nodejs, jq"
 +TERMUX_PKG_BUILD_IN_SRC=true
 +
++termux_step_post_get_source() {
++	# Paket ini tanpa source unduhan (SRCDIR kosong). Langkah lisensi
++	# Termux (termux_step_install_license) menuntut file lisensi MIT
++	# ditemukan DI SRCDIR — tanpa ini build mati:
++	# "Could not find a license file for MIT in the package sources"
++	# (terbukti di run-5, paket terakhir, setelah semua dependensi lolos).
++	cp "$TERMUX_PKG_BUILDER_DIR/files/LICENSE" "$TERMUX_PKG_SRCDIR/LICENSE"
++}
++
 +termux_step_make_install() {
 +	local src="$TERMUX_PKG_BUILDER_DIR/files"
 +	install -Dm755 "$src/sannlab" "$TERMUX_PREFIX/bin/sannlab"
@@ -20,6 +29,33 @@ index 0000000..fd73778
 +	install -Dm644 "$src/sannlab.sh" "$TERMUX_PREFIX/share/sannlab/sannlab.sh"
 +	install -Dm644 -t "$TERMUX_PREFIX/share/sannlab/presets" "$src"/presets/*.properties
 +}
+diff --git a/packages/sannlab-tools/files/LICENSE b/packages/sannlab-tools/files/LICENSE
+new file mode 100644
+index 0000000..7740a7e
+--- /dev/null
++++ b/packages/sannlab-tools/files/LICENSE
+@@ -0,0 +1,21 @@
++MIT License
++
++Copyright (c) 2026 Sann
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
 diff --git a/packages/sannlab-tools/files/presets/amoled.colors.properties b/packages/sannlab-tools/files/presets/amoled.colors.properties
 new file mode 100644
 index 0000000..e44981c

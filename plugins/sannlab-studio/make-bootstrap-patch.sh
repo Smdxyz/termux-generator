@@ -19,6 +19,7 @@ cp sannlab-tools/build.sh "$TMP/packages/sannlab-tools/build.sh"
 cp sannlab-tools/src/sannlab    "$TMP/packages/sannlab-tools/files/sannlab"
 cp sannlab-tools/src/sannlab.js "$TMP/packages/sannlab-tools/files/sannlab.js"
 cp sannlab-tools/src/sannlab.sh "$TMP/packages/sannlab-tools/files/sannlab.sh"
+cp sannlab-tools/src/LICENSE    "$TMP/packages/sannlab-tools/files/LICENSE"
 cp sannlab-tools/src/presets/*.properties "$TMP/packages/sannlab-tools/files/presets/"
 
 cd "$TMP"

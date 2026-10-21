@@ -1,5 +1,17 @@
 # Changelog — SannLab Studio
 
+## 2026-10-21 — Fix run-5: LICENSE hilang di sannlab-tools
+
+- **Run-5 mati di paket TERAKHIR (`sannlab-tools`)** setelah seluruh closure
+  super lite (136 paket) terbangun: `termux_step_install_license` menuntut
+  file lisensi MIT di SRCDIR, dan paket ini tanpa source unduhan sehingga
+  SRCDIR kosong. Fix: `sannlab-tools/src/LICENSE` baru + hook
+  `termux_step_post_get_source()` di resep yang menyalinnya ke SRCDIR +
+  `make-bootstrap-patch.sh` menyertakan LICENSE ke `files/` + patch
+  bootstrap diregenerasi. Terverifikasi dengan mengeksekusi fungsi
+  `termux_step_install_license` ASLI Termux terhadap resep hasil patch:
+  lisensi terpasang sebagai `share/doc/sannlab-tools/copyright`.
+
 ## 2026-10-21 — Versi SUPER LITE difinalkan
 
 - List `--add` final: `nodejs,python,python-pip,git,openssh,curl,jq,tmux,termux-api,sannlab-tools`
